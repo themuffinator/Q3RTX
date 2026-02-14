@@ -1,0 +1,6 @@
+option(
+  'with_curl',
+  type: 'boolean',
+  value: true,
+  description: 'Link bundled libcurl static library support'
+)

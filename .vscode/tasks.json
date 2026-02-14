@@ -1,0 +1,151 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "meson: configure rtx release",
+      "type": "shell",
+      "command": "meson",
+      "args": [
+        "setup",
+        "build/meson-release",
+        "--wipe",
+        "--buildtype=release"
+      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\tools\\build\\meson_setup.ps1",
+          "setup",
+          "build/meson-release",
+          "--wipe",
+          "--buildtype=release"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "meson: build rtx release",
+      "type": "shell",
+      "command": "meson",
+      "args": [
+        "compile",
+        "-C",
+        "build/meson-release"
+      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\tools\\build\\meson_setup.ps1",
+          "compile",
+          "-C",
+          "build/meson-release"
+        ]
+      },
+      "dependsOn": [
+        "meson: configure rtx release"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "meson: configure rtx debug",
+      "type": "shell",
+      "command": "meson",
+      "args": [
+        "setup",
+        "build/meson-debug",
+        "--wipe",
+        "--buildtype=debug"
+      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\tools\\build\\meson_setup.ps1",
+          "setup",
+          "build/meson-debug",
+          "--wipe",
+          "--buildtype=debug"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "meson: build rtx debug",
+      "type": "shell",
+      "command": "meson",
+      "args": [
+        "compile",
+        "-C",
+        "build/meson-debug"
+      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\tools\\build\\meson_setup.ps1",
+          "compile",
+          "-C",
+          "build/meson-debug"
+        ]
+      },
+      "dependsOn": [
+        "meson: configure rtx debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "meson: clean all",
+      "type": "shell",
+      "command": "sh",
+      "args": [
+        "-c",
+        "rm -rf build/meson-release build/meson-debug"
+      ],
+      "windows": {
+        "command": "cmd",
+        "args": [
+          "/c",
+          "if exist build\\meson-release rmdir /s /q build\\meson-release & if exist build\\meson-debug rmdir /s /q build\\meson-debug"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
