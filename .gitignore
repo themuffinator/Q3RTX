@@ -1,7 +1,6 @@
 build/
 output/
-.q3home/
-.q3home/*
+.q3home*/
 .vs/
 .vscode/
 !.vscode/
