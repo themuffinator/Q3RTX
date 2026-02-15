@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include <errno.h>
 #include <direct.h>
 #include <io.h>
+#include <dbghelp.h>
 
 
 #define MEM_THRESHOLD (96*1024*1024)
@@ -479,6 +480,52 @@ LOAD/UNLOAD DLL
 */
 
 static int dll_err_count = 0;
+static char dll_last_error[1024];
+
+static void Sys_ClearLibraryError( void )
+{
+	dll_last_error[0] = '\0';
+}
+
+static void Sys_SetLibraryErrorFromWin32( DWORD errorCode )
+{
+	char systemMessage[768];
+	DWORD len;
+
+	if ( errorCode == 0 ) {
+		Sys_ClearLibraryError();
+		return;
+	}
+
+	len = FormatMessageA(
+		FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL,
+		errorCode,
+		MAKELANGID( LANG_NEUTRAL, SUBLANG_DEFAULT ),
+		systemMessage,
+		ARRAY_LEN( systemMessage ),
+		NULL );
+
+	if ( len == 0 ) {
+		Com_sprintf( dll_last_error, sizeof( dll_last_error ), "Win32 error code %lu", (unsigned long)errorCode );
+		return;
+	}
+
+	while ( len > 0 ) {
+		const char ch = systemMessage[ len - 1 ];
+		if ( ch != '\r' && ch != '\n' && ch != ' ' && ch != '\t' ) {
+			break;
+		}
+		systemMessage[ --len ] = '\0';
+	}
+
+	Com_sprintf( dll_last_error, sizeof( dll_last_error ), "%s (code %lu)", systemMessage, (unsigned long)errorCode );
+}
+
+const char *Sys_LibraryError( void )
+{
+	return dll_last_error;
+}
 
 /*
 =================
@@ -488,16 +535,28 @@ Sys_LoadLibrary
 void *Sys_LoadLibrary( const char *name )
 {
 	const char *ext;
+	HMODULE lib;
 
 	if ( !name || !*name )
+	{
+		Q_strncpyz( dll_last_error, "Empty library path", sizeof( dll_last_error ) );
 		return NULL;
+	}
 
 	if ( FS_AllowedExtension( name, qfalse, &ext ) )
 	{
 		Com_Error( ERR_FATAL, "Sys_LoadLibrary: Unable to load library with '%s' extension", ext );
 	}
 
-	return (void *)LoadLibrary( AtoW( name ) );
+	SetLastError( 0 );
+	lib = LoadLibrary( AtoW( name ) );
+	if ( !lib ) {
+		Sys_SetLibraryErrorFromWin32( GetLastError() );
+		return NULL;
+	}
+
+	Sys_ClearLibraryError();
+	return (void *)lib;
 }
 
 
@@ -671,6 +730,7 @@ static const char *GetExceptionName( DWORD code )
 
 	switch ( code )
 	{
+		case EXCEPTION_BREAKPOINT: return "BREAKPOINT";
 		case EXCEPTION_ACCESS_VIOLATION: return "ACCESS_VIOLATION";
 		case EXCEPTION_DATATYPE_MISALIGNMENT: return "DATATYPE_MISALIGNMENT";
 		case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "ARRAY_BOUNDS_EXCEEDED";
@@ -687,6 +747,187 @@ static const char *GetExceptionName( DWORD code )
 
 	sprintf( buf, "0x%08X", (unsigned int)code );
 	return buf;
+}
+
+static qboolean Sys_GetModuleDirectory( char *outDir, size_t outDirSize )
+{
+	DWORD copied;
+	char *slash;
+
+	if ( !outDir || outDirSize < 2 ) {
+		return qfalse;
+	}
+
+	copied = GetModuleFileNameA( NULL, outDir, (DWORD)( outDirSize - 1 ) );
+	if ( copied == 0 || copied >= outDirSize ) {
+		outDir[0] = '\0';
+		return qfalse;
+	}
+	outDir[copied] = '\0';
+
+	slash = strrchr( outDir, '\\' );
+	if ( !slash ) {
+		slash = strrchr( outDir, '/' );
+	}
+	if ( slash ) {
+		*slash = '\0';
+	}
+
+	return qtrue;
+}
+
+static qboolean Sys_BuildCrashDumpPath( DWORD exceptionCode, char *outPath, size_t outPathSize )
+{
+	char moduleDir[MAX_OSPATH];
+	char dumpDir[MAX_OSPATH];
+	SYSTEMTIME now;
+
+	if ( !outPath || outPathSize < 2 ) {
+		return qfalse;
+	}
+
+	outPath[0] = '\0';
+
+	if ( !Sys_GetModuleDirectory( moduleDir, sizeof( moduleDir ) ) ) {
+		return qfalse;
+	}
+
+	Com_sprintf( dumpDir, sizeof( dumpDir ), "%s\\crashdumps", moduleDir );
+	if ( !CreateDirectoryA( dumpDir, NULL ) ) {
+		DWORD createError = GetLastError();
+		if ( createError != ERROR_ALREADY_EXISTS ) {
+			return qfalse;
+		}
+	}
+
+	GetLocalTime( &now );
+	Com_sprintf(
+		outPath,
+		outPathSize,
+		"%s\\q3rtx-crash-%04u%02u%02u-%02u%02u%02u-p%lu-t%lu-%08X.dmp",
+		dumpDir,
+		(unsigned int)now.wYear,
+		(unsigned int)now.wMonth,
+		(unsigned int)now.wDay,
+		(unsigned int)now.wHour,
+		(unsigned int)now.wMinute,
+		(unsigned int)now.wSecond,
+		(unsigned long)GetCurrentProcessId(),
+		(unsigned long)GetCurrentThreadId(),
+		(unsigned int)exceptionCode );
+	return qtrue;
+}
+
+static qboolean Sys_WriteMiniDump( struct _EXCEPTION_POINTERS *ExceptionInfo, char *outPath, size_t outPathSize, DWORD *outError )
+{
+	typedef BOOL (WINAPI *PFN_MiniDumpWriteDump)(
+		HANDLE hProcess,
+		DWORD processId,
+		HANDLE hFile,
+		MINIDUMP_TYPE dumpType,
+		PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
+		PMINIDUMP_USER_STREAM_INFORMATION userStreamParam,
+		PMINIDUMP_CALLBACK_INFORMATION callbackParam );
+
+	HMODULE dbghelp;
+	PFN_MiniDumpWriteDump pMiniDumpWriteDump;
+	HANDLE dumpFile = INVALID_HANDLE_VALUE;
+	MINIDUMP_EXCEPTION_INFORMATION dumpExceptionInfo;
+	MINIDUMP_TYPE dumpType;
+	DWORD dumpError = ERROR_SUCCESS;
+	BOOL wroteDump = FALSE;
+
+	if ( outError ) {
+		*outError = ERROR_SUCCESS;
+	}
+	if ( outPath && outPathSize > 0 ) {
+		outPath[0] = '\0';
+	}
+
+	if ( !ExceptionInfo || !outPath || outPathSize < 2 ) {
+		if ( outError ) {
+			*outError = ERROR_INVALID_PARAMETER;
+		}
+		return qfalse;
+	}
+
+	if ( !Sys_BuildCrashDumpPath( ExceptionInfo->ExceptionRecord->ExceptionCode, outPath, outPathSize ) ) {
+		if ( outError ) {
+			*outError = GetLastError();
+		}
+		return qfalse;
+	}
+
+	dbghelp = LoadLibraryA( "dbghelp.dll" );
+	if ( !dbghelp ) {
+		if ( outError ) {
+			*outError = GetLastError();
+		}
+		return qfalse;
+	}
+
+	pMiniDumpWriteDump = (PFN_MiniDumpWriteDump)GetProcAddress( dbghelp, "MiniDumpWriteDump" );
+	if ( !pMiniDumpWriteDump ) {
+		dumpError = GetLastError();
+		FreeLibrary( dbghelp );
+		if ( outError ) {
+			*outError = dumpError;
+		}
+		return qfalse;
+	}
+
+	dumpFile = CreateFileA(
+		outPath,
+		GENERIC_WRITE,
+		FILE_SHARE_READ,
+		NULL,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL );
+	if ( dumpFile == INVALID_HANDLE_VALUE ) {
+		dumpError = GetLastError();
+		FreeLibrary( dbghelp );
+		if ( outError ) {
+			*outError = dumpError;
+		}
+		return qfalse;
+	}
+
+	dumpExceptionInfo.ThreadId = GetCurrentThreadId();
+	dumpExceptionInfo.ExceptionPointers = ExceptionInfo;
+	dumpExceptionInfo.ClientPointers = FALSE;
+
+	dumpType = (MINIDUMP_TYPE)(
+		MiniDumpNormal |
+		MiniDumpWithDataSegs |
+		MiniDumpWithHandleData |
+		MiniDumpWithThreadInfo |
+		MiniDumpWithIndirectlyReferencedMemory |
+		MiniDumpScanMemory );
+
+	wroteDump = pMiniDumpWriteDump(
+		GetCurrentProcess(),
+		GetCurrentProcessId(),
+		dumpFile,
+		dumpType,
+		&dumpExceptionInfo,
+		NULL,
+		NULL );
+	dumpError = wroteDump ? ERROR_SUCCESS : GetLastError();
+
+	CloseHandle( dumpFile );
+	FreeLibrary( dbghelp );
+
+	if ( !wroteDump ) {
+		DeleteFileA( outPath );
+		outPath[0] = '\0';
+		if ( outError ) {
+			*outError = dumpError;
+		}
+		return qfalse;
+	}
+
+	return qtrue;
 }
 
 
@@ -711,17 +952,21 @@ static LONG WINAPI ExceptionFilter( struct _EXCEPTION_POINTERS *ExceptionInfo )
 	}
 #endif
 
-	if ( ExceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT )
 	{
-		char msg[128], name[MAX_OSPATH];
+		char msg[1024], name[MAX_OSPATH], dumpPath[MAX_OSPATH];
 		const char *basename;
 		HMODULE hModule, hKernel32;
 		byte *addr;
+		DWORD dumpError;
+		qboolean wroteDump;
 
 		hModule = NULL;
 		name[0] = '\0';
+		dumpPath[0] = '\0';
 		basename = name;
 		addr = (byte*)ExceptionInfo->ExceptionRecord->ExceptionAddress;
+		dumpError = ERROR_SUCCESS;
+		wroteDump = Sys_WriteMiniDump( ExceptionInfo, dumpPath, sizeof( dumpPath ), &dumpError );
 
 		hKernel32 = GetModuleHandleA( "kernel32" );
 		if ( hKernel32 != NULL ) {
@@ -756,6 +1001,16 @@ static LONG WINAPI ExceptionFilter( struct _EXCEPTION_POINTERS *ExceptionInfo )
 			Com_sprintf( msg, sizeof( msg ), "Exception Code: %s\nException Address: %p",
 				GetExceptionName( ExceptionInfo->ExceptionRecord->ExceptionCode ),
 				addr );
+		}
+		if ( wroteDump ) {
+			Q_strcat( msg, sizeof( msg ), "\nCrash dump: " );
+			Q_strcat( msg, sizeof( msg ), dumpPath );
+		} else {
+			Com_sprintf(
+				msg + strlen( msg ),
+				sizeof( msg ) - strlen( msg ),
+				"\nCrash dump: failed (error 0x%08X)",
+				(unsigned int)dumpError );
 		}
 
 		Com_Error( ERR_DROP, "Unhandled exception caught\n%s", msg );

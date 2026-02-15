@@ -1,0 +1,220 @@
+name: rtx-meson-hardening
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rtx-meson-hardening.yml"
+      - "meson.build"
+      - "meson_options.txt"
+      - "scripts/**"
+      - "tools/build/**"
+      - "code/client/**"
+      - "code/qcommon/**"
+      - "code/win32/**"
+      - "code/unix/**"
+      - "code/rendererrtx/**"
+      - "doc/rtx-driver-matrix.md"
+      - "doc/rtx-renderer-implementation-plan.md"
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/rtx-meson-hardening.yml"
+      - "meson.build"
+      - "meson_options.txt"
+      - "scripts/**"
+      - "tools/build/**"
+      - "code/client/**"
+      - "code/qcommon/**"
+      - "code/win32/**"
+      - "code/unix/**"
+      - "code/rendererrtx/**"
+      - "doc/rtx-driver-matrix.md"
+      - "doc/rtx-renderer-implementation-plan.md"
+  workflow_dispatch:
+
+jobs:
+  meson-build-package:
+    name: meson-${{ matrix.os_id }}-${{ matrix.buildtype }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            os_id: windows
+            buildtype: debug
+          - os: windows-2022
+            os_id: windows
+            buildtype: release
+          - os: ubuntu-24.04
+            os_id: linux
+            buildtype: debug
+          - os: ubuntu-24.04
+            os_id: linux
+            buildtype: release
+          - os: macos-14
+            os_id: macos
+            buildtype: debug
+          - os: macos-14
+            os_id: macos
+            buildtype: release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install meson/ninja
+        run: python -m pip install --upgrade pip meson ninja
+
+      - name: Install Linux build dependencies
+        if: matrix.os_id == 'linux'
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -y install \
+            libcurl4-openssl-dev \
+            mesa-common-dev \
+            libxxf86dga-dev \
+            libxrandr-dev \
+            libxxf86vm-dev \
+            libasound-dev \
+            libsdl2-dev \
+            libvulkan-dev \
+            vulkan-tools \
+            mesa-vulkan-drivers \
+            xvfb
+
+      - name: Install macOS build dependencies
+        if: matrix.os_id == 'macos'
+        run: brew install sdl2 molten-vk
+
+      - name: Configure (Windows)
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        run: |
+          ./tools/build/meson_setup.ps1 setup "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}" --wipe --buildtype=${{ matrix.buildtype }}
+
+      - name: Configure (POSIX)
+        if: matrix.os_id != 'windows'
+        run: |
+          meson setup "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}" --wipe --buildtype=${{ matrix.buildtype }}
+
+      - name: Compile
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        run: |
+          ./tools/build/meson_setup.ps1 compile -C "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}"
+
+      - name: Compile (POSIX)
+        if: matrix.os_id != 'windows'
+        run: |
+          meson compile -C "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}"
+
+      - name: Package and validate runtime (strict Linux)
+        if: matrix.os_id == 'linux'
+        run: |
+          python scripts/rtx_package.py \
+            --build-dir "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}" \
+            --output-dir "build/package-${{ matrix.os_id }}-${{ matrix.buildtype }}" \
+            --platform "${{ matrix.os_id }}" \
+            --strict
+
+      - name: Package and validate runtime
+        if: matrix.os_id != 'linux'
+        run: |
+          python scripts/rtx_package.py \
+            --build-dir "build/ci-${{ matrix.os_id }}-${{ matrix.buildtype }}" \
+            --output-dir "build/package-${{ matrix.os_id }}-${{ matrix.buildtype }}" \
+            --platform "${{ matrix.os_id }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os_id }}-${{ matrix.buildtype }}
+          path: build/package-${{ matrix.os_id }}-${{ matrix.buildtype }}
+          if-no-files-found: error
+          retention-days: 7
+
+  startup-smoke-linux:
+    name: startup-smoke-linux
+    runs-on: ubuntu-24.04
+    needs: [meson-build-package]
+    env:
+      # Optional CI variable for environments with Quake III content installed.
+      Q3RTX_BASEPATH: ${{ vars.Q3RTX_BASEPATH }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install meson/ninja
+        run: python -m pip install --upgrade pip meson ninja
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -y install \
+            libcurl4-openssl-dev \
+            mesa-common-dev \
+            libxxf86dga-dev \
+            libxrandr-dev \
+            libxxf86vm-dev \
+            libasound-dev \
+            libsdl2-dev \
+            libvulkan-dev \
+            vulkan-tools \
+            mesa-vulkan-drivers \
+            xvfb
+
+      - name: Configure + compile debug
+        run: |
+          meson setup build/ci-smoke --wipe --buildtype=debug
+          meson compile -C build/ci-smoke
+
+      - name: Run renderer startup smoke checks
+        run: |
+          mkdir -p build/smoke-reports
+          xvfb-run -a python scripts/rtx_smoke_test.py \
+            --binary build/ci-smoke/q3rtx \
+            --renderer rtx \
+            --seconds 10 \
+            --map none \
+            --report build/smoke-reports/rtx.json \
+            --skip-if-basepath-missing
+          xvfb-run -a python scripts/rtx_smoke_test.py \
+            --binary build/ci-smoke/q3rtx \
+            --renderer opengl \
+            --seconds 10 \
+            --map none \
+            --report build/smoke-reports/opengl.json \
+            --skip-if-basepath-missing
+          xvfb-run -a python scripts/rtx_smoke_test.py \
+            --binary build/ci-smoke/q3rtx \
+            --renderer opengl2 \
+            --seconds 10 \
+            --map none \
+            --report build/smoke-reports/opengl2.json \
+            --skip-if-basepath-missing
+          xvfb-run -a python scripts/rtx_smoke_test.py \
+            --binary build/ci-smoke/q3rtx \
+            --renderer vulkan \
+            --seconds 10 \
+            --map none \
+            --report build/smoke-reports/vulkan.json \
+            --skip-if-basepath-missing
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: startup-smoke-linux-reports
+          path: build/smoke-reports
+          if-no-files-found: error
+          retention-days: 7

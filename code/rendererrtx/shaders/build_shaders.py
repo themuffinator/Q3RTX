@@ -599,7 +599,7 @@ def compile_variant(glslang: Path, shader_dir: Path, temp_spv: Path, variant: Sh
 		variant.source,
 	]
 	if variant.stage in {"rgen", "rmiss", "rchit"}:
-		command.extend(["--target-env", "vulkan1.2"])
+		command.extend(["--target-env", "spirv1.4"])
 	command.extend(f"-D{macro}" for macro in variant.defines)
 
 	result = subprocess.run(

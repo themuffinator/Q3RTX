@@ -461,6 +461,12 @@ LOAD/UNLOAD DLL
 
 
 static int dll_err_count = 0;
+static char dll_last_error[1024];
+
+const char *Sys_LibraryError( void )
+{
+	return dll_last_error;
+}
 
 
 /*
@@ -472,13 +478,31 @@ void *Sys_LoadLibrary( const char *name )
 {
 	const char *ext;
 	void *handle;
+	const char *error;
+
+	if ( !name || !*name ) {
+		Q_strncpyz( dll_last_error, "Empty library path", sizeof( dll_last_error ) );
+		return NULL;
+	}
 
 	if ( FS_AllowedExtension( name, qfalse, &ext ) )
 	{
 		Com_Error( ERR_FATAL, "Sys_LoadLibrary: Unable to load library with '%s' extension", ext );
 	}
 
+	dlerror(); /* clear old error state */
 	handle = dlopen( name, RTLD_NOW );
+	if ( !handle ) {
+		error = dlerror();
+		if ( error && *error ) {
+			Q_strncpyz( dll_last_error, error, sizeof( dll_last_error ) );
+		} else {
+			Q_strncpyz( dll_last_error, "Unknown dlopen error", sizeof( dll_last_error ) );
+		}
+		return NULL;
+	}
+
+	dll_last_error[0] = '\0';
 	return handle;
 }
 

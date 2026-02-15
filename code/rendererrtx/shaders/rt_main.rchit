@@ -1,11 +1,16 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 const float PI = 3.14159265359;
+const uint RTX_RT_COLORSPACE_SRGB = 1u;
+const uint RTX_RT_MAX_SCENE_TEXTURES = 2048u;
+const uint RTX_RT_INVALID_TEXTURE_INDEX = 0xFFFFFFFFu;
 const uint RTX_RT_MATFLAG_MASKED = 1u << 0;
 const uint RTX_RT_MATFLAG_EMISSIVE = 1u << 1;
 const uint RTX_RT_MATFLAG_TRANSLUCENT = 1u << 2;
 const uint RTX_RT_MATFLAG_PARTICLE = 1u << 6;
+const uint RTX_RT_MATFLAG_EFFECT = 1u << 7;
 const uint RTX_RT_MODE_FLAG_PARTICLE_VOLUME = 1u << 3;
 const uint RTX_RT_PAYLOAD_FLAG_HIT = 1u << 0;
 const uint RTX_RT_PAYLOAD_FLAG_DYNAMIC = 1u << 1;
@@ -31,6 +36,7 @@ struct RtGpuMaterial {
 	vec4 emissiveColorScale;
 	vec4 pbrParams;
 	uvec4 metadata;
+	uvec4 textureInfo;
 };
 
 struct RtLight {
@@ -78,6 +84,7 @@ layout(set = 0, binding = 11, std430) readonly buffer RtTemporalParamsBuffer {
 	vec4 readabilityParams;
 	uvec4 modes;
 } u_temporal;
+layout(set = 0, binding = 13) uniform sampler2D u_sceneTextures[RTX_RT_MAX_SCENE_TEXTURES];
 
 layout(push_constant) uniform RtPushConstants {
 	vec4 cameraOriginTanHalfFovX;
@@ -111,6 +118,15 @@ uint hash_u32(uint x)
 	x *= 0x846ca68bu;
 	x ^= x >> 16;
 	return x;
+}
+
+uint hash_world_cell(vec3 p)
+{
+	ivec3 cell = ivec3(floor(p * 0.25));
+	uint h = hash_u32(uint(cell.x) * 73856093u);
+	h = hash_u32(h ^ (uint(cell.y) * 19349663u));
+	h = hash_u32(h ^ (uint(cell.z) * 83492791u));
+	return h;
 }
 
 float rand01(inout uint state)
@@ -179,11 +195,13 @@ vec3 sample_cosine_hemisphere(vec3 normal, inout uint rngState)
 vec3 evaluate_environment(vec3 rayDir)
 {
 	float up = clamp(rayDir.z * 0.5 + 0.5, 0.0, 1.0);
-	vec3 skyBottom = vec3(0.055, 0.070, 0.090);
-	vec3 skyTop = vec3(0.32, 0.44, 0.67);
+	vec3 sunColor = max(pc.sunColorIntensity.rgb * pc.sunIntensity, vec3(0.0));
+	float sunLuma = max(dot(sunColor, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+	vec3 sunTint = sunColor / sunLuma;
+	vec3 skyBottom = mix(vec3(0.040, 0.050, 0.070), sunTint * 0.070, 0.55);
+	vec3 skyTop = mix(vec3(0.24, 0.33, 0.52), sunTint * 0.300, 0.75);
 	vec3 skyColor = mix(skyBottom, skyTop, up) * pc.skyIntensity;
 	vec3 sunDir = normalize(pc.sunDirection.xyz);
-	vec3 sunColor = pc.sunColorIntensity.rgb * pc.sunIntensity;
 	float sunDisk = pow(max(dot(rayDir, sunDir), 0.0), 320.0);
 	return skyColor + sunColor * sunDisk;
 }
@@ -266,13 +284,33 @@ void main()
 	vec3 worldPos = v0.xyz.xyz * b0 + v1.xyz.xyz * b1 + v2.xyz.xyz * b2;
 	vec3 normal = normalize(v0.normal.xyz * b0 + v1.normal.xyz * b1 + v2.normal.xyz * b2);
 	vec2 uv = v0.texCoord * b0 + v1.texCoord * b1 + v2.texCoord * b2;
+	vec3 vertexColor =
+		unpackUnorm4x8(v0.color).rgb * b0 +
+		unpackUnorm4x8(v1.color).rgb * b1 +
+		unpackUnorm4x8(v2.color).rgb * b2;
 	RtGpuMaterial material = fetch_material(geometryClass, v0.materialIndex);
-	vec3 albedo = clamp(material.baseColor.rgb, 0.0, 1.0);
+	vec4 albedoSample = vec4(1.0);
+	uint albedoTextureIndex = material.textureInfo.x;
+	bool hasAlbedoTexture = albedoTextureIndex != RTX_RT_INVALID_TEXTURE_INDEX && albedoTextureIndex < RTX_RT_MAX_SCENE_TEXTURES;
+	if (hasAlbedoTexture) {
+		albedoSample = texture(u_sceneTextures[nonuniformEXT(albedoTextureIndex)], uv);
+		if (material.metadata.y == RTX_RT_COLORSPACE_SRGB) {
+			albedoSample.rgb = pow(max(albedoSample.rgb, vec3(0.0)), vec3(2.2));
+		}
+	}
+	vec3 albedo = material.baseColor.rgb * albedoSample.rgb;
+	float materialAlpha = clamp(material.baseColor.a * albedoSample.a, 0.0, 1.0);
 	float roughness = clamp(material.pbrParams.x, 0.04, 1.0);
 	float metallic = clamp(material.pbrParams.y, 0.0, 1.0);
 	float alphaCutoff = clamp(material.pbrParams.z, 0.0, 1.0);
 	uint materialFlags = material.metadata.x;
 	vec3 emissive = material.emissiveColorScale.rgb * material.emissiveColorScale.w;
+	if ((materialFlags & RTX_RT_MATFLAG_EFFECT) != 0u) {
+		vec3 tint = max(vertexColor, vec3(0.05));
+		albedo *= tint;
+		emissive *= tint;
+	}
+	albedo = clamp(albedo, 0.0, 1.0);
 	vec3 V = normalize(-gl_WorldRayDirectionEXT);
 	vec3 N = normalize(normal);
 	float NdotV;
@@ -280,6 +318,7 @@ void main()
 	vec3 Lo = vec3(0.0);
 	uint contributingLights = 0u;
 	uint seed = hash_u32(gl_PrimitiveID * 7477u + gl_InstanceCustomIndexEXT * 341u + pc.frameIndex * 1597u);
+	seed = hash_u32(seed ^ hash_world_cell(worldPos) ^ floatBitsToUint(gl_HitTEXT));
 
 	if (dot(N, V) < 0.0) {
 		N = -N;
@@ -291,8 +330,11 @@ void main()
 	payloadRadiance.flags = RTX_RT_PAYLOAD_FLAG_HIT | (geometryClass == 1u ? RTX_RT_PAYLOAD_FLAG_DYNAMIC : 0u);
 
 	if ((materialFlags & RTX_RT_MATFLAG_MASKED) != 0u && alphaCutoff > 0.0) {
-		float pseudoAlpha = fract(uv.x * 17.0 + uv.y * 29.0);
-		if (pseudoAlpha < alphaCutoff) {
+		float alpha = materialAlpha;
+		if (!hasAlbedoTexture) {
+			alpha = fract(uv.x * 17.0 + uv.y * 29.0);
+		}
+		if (alpha < alphaCutoff) {
 			payloadRadiance.color = evaluate_environment(normalize(gl_WorldRayDirectionEXT));
 			payloadRadiance.hitT = 0.0;
 			payloadRadiance.flags = 0u;
@@ -315,11 +357,17 @@ void main()
 			vec3 toLight = light.positionRadius.xyz - worldPos;
 			float dist = length(toLight);
 			float radius = max(light.positionRadius.w, 0.001);
+			float invRadius = 1.0 / radius;
 			if (dist >= radius || dist <= 1e-4) {
 				continue;
 			}
 			L = toLight / dist;
-			radianceScale = pow(max(1.0 - dist / radius, 0.0), 2.0);
+			{
+				float edge = max(1.0 - dist * invRadius, 0.0);
+				float falloff = edge * edge;
+				float distAtten = 1.0 / (1.0 + (dist * dist) * (invRadius * invRadius) * 2.0);
+				radianceScale = falloff * distAtten;
+			}
 			maxT = dist - 0.02;
 		}
 
@@ -329,14 +377,22 @@ void main()
 		}
 
 		if (pc.shadowMode > 0u) {
-			vec3 shadowDir = L;
 			if (pc.shadowMode > 1u) {
 				float coneAngle = clamp(light.directionSoftness.w, 0.0, 1.0);
-				coneAngle *= (light.colorType.w > 0.5) ? 0.035 : 0.25;
-				shadowDir = sample_cone(shadowDir, coneAngle, seed);
+				vec3 shadowDir0;
+				vec3 shadowDir1;
+				float vis0;
+				float vis1;
+				coneAngle *= (light.colorType.w > 0.5) ? 0.02 : 0.18;
+				shadowDir0 = sample_cone(L, coneAngle, seed);
+				shadowDir1 = sample_cone(L, coneAngle, seed);
+				vis0 = trace_shadow_visibility(worldPos + N * 0.01, shadowDir0, maxT);
+				vis1 = trace_shadow_visibility(worldPos + N * 0.01, shadowDir1, maxT);
+				visibility = 0.5 * (vis0 + vis1);
+			} else {
+				visibility = trace_shadow_visibility(worldPos + N * 0.01, L, maxT);
 			}
-			visibility = trace_shadow_visibility(worldPos + N * 0.01, shadowDir, maxT);
-			if (visibility <= 0.0) {
+			if (visibility <= 0.001) {
 				continue;
 			}
 		}

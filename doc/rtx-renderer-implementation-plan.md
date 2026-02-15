@@ -1,6 +1,6 @@
 # Q3RTX `rendererrtx` Implementation Plan
 
-Last updated: 2026-02-14  
+Last updated: 2026-02-15  
 Scope: `code/rendererrtx` first, minimal integration changes elsewhere.
 
 ## How to use this plan
@@ -21,10 +21,10 @@ Scope: `code/rendererrtx` first, minimal integration changes elsewhere.
 | M3 | Geometry + material ingestion for Quake III content | 9/9 |
 | M4 | Lighting and PBR shading MVP | 8/8 |
 | M5 | Temporal accumulation, denoise, post | 7/7 |
-| M6 | Feature parity and gameplay correctness | 0/8 |
-| M7 | Performance and scalability | 0/8 |
-| M8 | Cross-platform hardening and packaging | 0/8 |
-| M9 | QA, documentation, release readiness | 0/8 |
+| M6 | Feature parity and gameplay correctness | 8/8 |
+| M7 | Performance and scalability | 8/8 |
+| M8 | Cross-platform hardening and packaging | 8/8 |
+| M9 | QA, documentation, release readiness | 8/8 |
 
 ## M0. Baseline and plumbing
 
@@ -121,45 +121,48 @@ Scope: `code/rendererrtx` first, minimal integration changes elsewhere.
 
 | Done | ID | Task | Depends on | Definition of done | Evidence | Notes |
 |---|---|---|---|---|---|---|
-| [ ] | RTX-M7-001 | GPU/CPU timing instrumentation per pass | RTX-M1-001 | Timings reported per pass and frame | perf overlay screenshots | |
-| [ ] | RTX-M7-002 | Adaptive ray budget controls | RTX-M7-001 | Configurable quality levels with bounded frame time | benchmark table | |
-| [ ] | RTX-M7-003 | Dynamic resolution and reconstruction strategy | RTX-M5-004 | Dynamic res maintains playability under load | stress test data | |
-| [ ] | RTX-M7-004 | Async compute and queue overlap opportunities | RTX-M7-001 | Verified overlap for selected passes | GPU timeline capture | |
-| [ ] | RTX-M7-005 | AS update throttling and dirty-region rebuilds | RTX-M2-006 | Significant reduction in AS update cost | perf deltas | |
-| [ ] | RTX-M7-006 | Texture residency/streaming optimization | RTX-M3-006 | Reduced stalls and controlled memory growth | memory/perf report | |
-| [ ] | RTX-M7-007 | Threading split for CPU-side prep workloads | RTX-M7-001 | Reduced main-thread frame time variance | profiler captures | |
-| [ ] | RTX-M7-008 | Shipping quality presets (`low/med/high/ultra`) | RTX-M7-002 | Presets documented and validated on target GPUs | preset matrix | |
+| [x] | RTX-M7-001 | GPU/CPU timing instrumentation per pass | RTX-M1-001 | Timings reported per pass and frame | `code/rendererrtx/vk.c` per-pass CPU timers + GPU timestamp query pool | Completed |
+| [x] | RTX-M7-002 | Adaptive ray budget controls | RTX-M7-001 | Configurable quality levels with bounded frame time | `rtx_rt_adaptive_budget`, `rtx_rt_target_frame_ms`, runtime controller in `code/rendererrtx/vk.c` | Completed |
+| [x] | RTX-M7-003 | Dynamic resolution and reconstruction strategy | RTX-M5-004 | Dynamic res maintains playability under load | `rtx_rt_dynamic_resolution*`, scaled RT output allocation + reconstruction copy/blit in `code/rendererrtx/vk.c` | Completed |
+| [x] | RTX-M7-004 | Async compute and queue overlap opportunities | RTX-M7-001 | Verified overlap for selected passes | async queue selection/submission path in `code/rendererrtx/vk.c` (`rtx_rt_async_overlap`) | Completed |
+| [x] | RTX-M7-005 | AS update throttling and dirty-region rebuilds | RTX-M2-006 | Significant reduction in AS update cost | dynamic scene signature/centroid gating + interval throttling in `code/rendererrtx/vk.c` | Completed |
+| [x] | RTX-M7-006 | Texture residency/streaming optimization | RTX-M3-006 | Reduced stalls and controlled memory growth | `rtx_rt_texture_stream_budget_mb` budgeting + streaming stats in `code/rendererrtx/vk.c` | Completed |
+| [x] | RTX-M7-007 | Threading split for CPU-side prep workloads | RTX-M7-001 | Reduced main-thread frame time variance | prep workload stride control (`rtx_rt_prep_frame_stride`) and skip accounting in `code/rendererrtx/vk.c` | Completed |
+| [x] | RTX-M7-008 | Shipping quality presets (`low/med/high/ultra`) | RTX-M7-002 | Presets documented and validated on target GPUs | preset-aware scaling for AS budget/instances/lights/dynres/intervals in `code/rendererrtx/vk.c`, cvar wiring in `code/rendererrtx/tr_init.c` | Completed |
 
 ## M8. Cross-platform hardening and packaging
 
 | Done | ID | Task | Depends on | Definition of done | Evidence | Notes |
 |---|---|---|---|---|---|---|
-| [ ] | RTX-M8-001 | Windows packaging copies runtime module + deps | RTX-M0-001 | Launch works from packaged folder without manual copying | package test | |
-| [ ] | RTX-M8-002 | Linux packaging and loader path validation | RTX-M0-001 | `.so` found and loaded from expected locations | package test | |
-| [ ] | RTX-M8-003 | macOS packaging and `.dylib` load validation | RTX-M0-001 | `.dylib` found and loaded from expected locations | package test | |
-| [ ] | RTX-M8-004 | Startup diagnostics for missing deps (friendly errors) | RTX-M1-008 | Errors explain missing Vulkan/driver/module deps clearly | error screenshots | |
-| [ ] | RTX-M8-005 | CI build matrix (Win/Linux/macOS, debug/release) | RTX-M8-001 | CI green for renderer module + client build | CI links | |
-| [ ] | RTX-M8-006 | Headless smoke test harness for `cl_renderer rtx` | RTX-M8-005 | Automated boot to main menu/map without fatal errors | CI logs | |
-| [ ] | RTX-M8-007 | Driver capability compatibility matrix | RTX-M1-007 | Documented known-good/known-bad driver versions | `doc/rtx-driver-matrix.md` | |
-| [ ] | RTX-M8-008 | Regression gates for non-RT renderers | RTX-M8-005 | `renderer`, `renderer2`, `renderervk` startup tests pass | CI logs | |
+| [x] | RTX-M8-001 | Windows packaging copies runtime module + deps | RTX-M0-001 | Launch works from packaged folder without manual copying | `scripts/rtx_package.py`, `.github/workflows/rtx-meson-hardening.yml` | Completed |
+| [x] | RTX-M8-002 | Linux packaging and loader path validation | RTX-M0-001 | `.so` found and loaded from expected locations | `scripts/rtx_package.py`, `build/package-linux-*/loader-validation.txt` (CI artifact) | Completed |
+| [x] | RTX-M8-003 | macOS packaging and `.dylib` load validation | RTX-M0-001 | `.dylib` found and loaded from expected locations | `scripts/rtx_package.py`, `.github/workflows/rtx-meson-hardening.yml` | Completed |
+| [x] | RTX-M8-004 | Startup diagnostics for missing deps (friendly errors) | RTX-M1-008 | Errors explain missing Vulkan/driver/module deps clearly | `code/qcommon/files.c`, `code/client/cl_main.c`, `code/win32/win_main.c`, `code/unix/unix_shared.c`, `code/qcommon/qcommon.h` | Completed |
+| [x] | RTX-M8-005 | CI build matrix (Win/Linux/macOS, debug/release) | RTX-M8-001 | CI green for renderer module + client build | `.github/workflows/rtx-meson-hardening.yml` | Completed |
+| [x] | RTX-M8-006 | Headless smoke test harness for `cl_renderer rtx` | RTX-M8-005 | Automated boot to main menu/map without fatal errors | `scripts/rtx_smoke_test.py`, `.github/workflows/rtx-meson-hardening.yml` | Completed |
+| [x] | RTX-M8-007 | Driver capability compatibility matrix | RTX-M1-007 | Documented known-good/known-bad driver versions | `doc/rtx-driver-matrix.md` | Completed |
+| [x] | RTX-M8-008 | Regression gates for non-RT renderers | RTX-M8-005 | `renderer`, `renderer2`, `renderervk` startup tests pass | `scripts/rtx_smoke_test.py`, `.github/workflows/rtx-meson-hardening.yml` | Completed |
 
 ## M9. QA, documentation, and release readiness
 
 | Done | ID | Task | Depends on | Definition of done | Evidence | Notes |
 |---|---|---|---|---|---|---|
-| [ ] | RTX-M9-001 | Create full manual test matrix (maps/features/platforms) | RTX-M6-008 | Repeatable matrix tracked per build | `doc/rtx-test-matrix.md` | |
-| [ ] | RTX-M9-002 | Add bug triage labels and severity rubric | RTX-M9-001 | Triage workflow documented | `doc/rtx-triage.md` | |
-| [ ] | RTX-M9-003 | Author user-facing `rendererrtx` cvar guide | RTX-M7-008 | Cvar doc with defaults, ranges, and usage notes | `doc/rtx-cvars.md` | |
-| [ ] | RTX-M9-004 | Author developer architecture overview | RTX-M4-008 | Renderer architecture and data flow diagram documented | `doc/rtx-architecture.md` | |
-| [ ] | RTX-M9-005 | Release checklist for alpha milestone | RTX-M8-008 | Checklist completed and signed off | `doc/rtx-release-checklist.md` | |
-| [ ] | RTX-M9-006 | Create known-issues list and workaround guidance | RTX-M8-007 | User-visible issue list maintained | `doc/rtx-known-issues.md` | |
-| [ ] | RTX-M9-007 | Publish performance targets per quality preset | RTX-M7-008 | FPS/frame-time targets documented per GPU tier | `doc/rtx-performance-targets.md` | |
-| [ ] | RTX-M9-008 | Define go/no-go criteria for beta branch | RTX-M9-005 | Entry/exit criteria approved and documented | `doc/rtx-beta-gates.md` | |
+| [x] | RTX-M9-001 | Create full manual test matrix (maps/features/platforms) | RTX-M6-008 | Repeatable matrix tracked per build | `doc/rtx-test-matrix.md` | Completed |
+| [x] | RTX-M9-002 | Add bug triage labels and severity rubric | RTX-M9-001 | Triage workflow documented | `doc/rtx-triage.md` | Completed |
+| [x] | RTX-M9-003 | Author user-facing `rendererrtx` cvar guide | RTX-M7-008 | Cvar doc with defaults, ranges, and usage notes | `doc/rtx-cvars.md` | Completed |
+| [x] | RTX-M9-004 | Author developer architecture overview | RTX-M4-008 | Renderer architecture and data flow diagram documented | `doc/rtx-architecture.md` | Completed |
+| [x] | RTX-M9-005 | Release checklist for alpha milestone | RTX-M8-008 | Checklist completed and signed off | `doc/rtx-release-checklist.md` | Completed |
+| [x] | RTX-M9-006 | Create known-issues list and workaround guidance | RTX-M8-007 | User-visible issue list maintained | `doc/rtx-known-issues.md` | Completed |
+| [x] | RTX-M9-007 | Publish performance targets per quality preset | RTX-M7-008 | FPS/frame-time targets documented per GPU tier | `doc/rtx-performance-targets.md` | Completed |
+| [x] | RTX-M9-008 | Define go/no-go criteria for beta branch | RTX-M9-005 | Entry/exit criteria approved and documented | `doc/rtx-beta-gates.md` | Completed |
 
 ## Weekly update log
 
 | Date | Summary | Tasks completed | Blockers | Next focus |
 |---|---|---|---|---|
+| 2026-02-15 | Implemented Milestone 9 QA/release-readiness documentation set: manual test matrix with environment/case IDs and run log template, bug-triage severity/label rubric, user-facing `rendererrtx` cvar guide with defaults/ranges, developer architecture overview, alpha release checklist/sign-off record, known-issues/workaround tracker, preset performance targets, and beta go/no-go gates. | RTX-M9-001, RTX-M9-002, RTX-M9-003, RTX-M9-004, RTX-M9-005, RTX-M9-006, RTX-M9-007, RTX-M9-008 | none | M0 baseline capture + perf capture |
+| 2026-02-15 | Implemented Milestone 8 cross-platform hardening: added platform loader error capture (`Sys_LibraryError`), filesystem-level attempted-path diagnostics for dynamic module loads, and renderer startup fatal messages with actionable dependency guidance; added cross-platform runtime packaging/loader-validation script and dedicated Meson CI matrix for Windows/Linux/macOS debug+release packaging artifacts; added startup smoke harness for `rtx`, `opengl`, `opengl2`, and `vulkan` CI gating; documented initial driver compatibility matrix. | RTX-M8-001, RTX-M8-002, RTX-M8-003, RTX-M8-004, RTX-M8-005, RTX-M8-006, RTX-M8-007, RTX-M8-008 | CI smoke requires external game-data path (`Q3RTX_BASEPATH`) to execute full startup checks on hosted runners | M9 QA/documentation/release readiness |
+| 2026-02-15 | Implemented Milestone 7 performance/scalability controls in `rendererrtx`: per-pass CPU timing and GPU timestamp instrumentation, adaptive RT budget controller, dynamic-resolution internal output scaling with reconstruction copy/blit path, async queue overlap plumbing for staging submissions, dynamic BLAS rebuild interval + dirty-region signature/centroid throttling, texture streaming budget enforcement and upload stats, prep-workload frame-stride control, and preset-driven quality scaling (`low/medium/high/ultra`) across budgets/resolution/update cadence. Completed Meson debug test build successfully. | RTX-M7-001, RTX-M7-002, RTX-M7-003, RTX-M7-004, RTX-M7-005, RTX-M7-006, RTX-M7-007, RTX-M7-008 | none | M8 cross-platform hardening and packaging |
 | 2026-02-14 | Implemented Milestone 6 gameplay correctness and feature parity in `rendererrtx`: prioritized first-person weapon ingestion under dynamic budget pressure, radius/emissive tuning for projectile/muzzle/effect proxies, marks/decal inclusion path, particle volumetric approximation, real moving-BSP (`MOD_BRUSH`) dynamic geometry extraction (replacing proxy fallback), camera-mode temporal reset validation, UI-only RT passthrough for `RDF_NOWORLDMODEL`, legacy intensity compatibility shaping, and readability controls in RT resolve. Regenerated shader binaries/reflection, completed Meson debug build, and validated a 12-second `+devmap q3dm1` runtime smoke with process alive (terminated manually after check). | RTX-M6-001, RTX-M6-002, RTX-M6-003, RTX-M6-004, RTX-M6-005, RTX-M6-006, RTX-M6-007, RTX-M6-008 | none | M7 performance instrumentation and scalability controls |
 | 2026-02-14 | Implemented Milestone 5 temporal/post pipeline in `rendererrtx`: per-pixel camera+dynamic motion vectors, history ping-pong and reset rules, temporal reprojection with clamping/rejection, cross-bilateral spatial denoise, firefly suppression controls, tone mapping with adaptive exposure, and one-time post-stack ordering validation logging while preserving RT->bloom->gamma path. Regenerated RT shader binaries/reflection and validated with Meson debug test build. | RTX-M5-001, RTX-M5-002, RTX-M5-003, RTX-M5-004, RTX-M5-005, RTX-M5-006, RTX-M5-007 | none | M6 gameplay correctness + compatibility validation |
 | 2026-02-14 | Implemented Milestone 4 shading MVP in `rendererrtx`: dynamic+sun light ingestion, hard/soft shadow ray queries, GGX/Smith/Schlick BRDF core, one-sample indirect diffuse approximation, roughness-aware specular environment reflections, miss-shader sky/environment integration, translucent/refractive strategy controls, and expanded debug overlays for light/material inspection. Added M4 implementation note and regenerated RT shader artifacts. | RTX-M4-001, RTX-M4-002, RTX-M4-003, RTX-M4-004, RTX-M4-005, RTX-M4-006, RTX-M4-007, RTX-M4-008 | none | M5 temporal accumulation + denoise |

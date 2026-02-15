@@ -389,8 +389,11 @@ typedef struct {
 	VkSurfaceFormatKHR present_format;
 
 	uint32_t queue_family_index;
+	uint32_t queue_family_queue_count;
 	VkDevice device;
 	VkQueue queue;
+	VkQueue async_queue;
+	qboolean async_queue_available;
 
 	VkSwapchainKHR swapchain;
 	uint32_t swapchain_image_count;
@@ -625,7 +628,7 @@ typedef struct {
 		VkDescriptorPool descriptor_pool;
 		VkDescriptorSetLayout descriptor_set_layout;
 		VkPipelineLayout pipeline_layout;
-		VkDescriptorSet descriptor_set;
+		VkDescriptorSet descriptor_set[ NUM_COMMAND_BUFFERS ];
 		VkPipeline pipeline;
 
 		rtxVkRtBuffer_t world_vertex_buffer;
@@ -678,6 +681,16 @@ typedef struct {
 		qboolean temporal_reset_pending;
 		qboolean temporal_has_prev_camera;
 		qboolean post_validation_logged;
+		float adaptive_budget_scale;
+		float dynamic_resolution_scale;
+		float dynamic_resolution_target_scale;
+		uint32_t dynamic_scene_signature;
+		int dynamic_last_rebuild_frame;
+		float dynamic_last_rebuild_centroid[3];
+		VkQueryPool timing_query_pool;
+		uint32_t timing_query_count;
+		uint32_t timing_query_stride;
+		float gpu_timestamp_period_ns;
 		float temporal_prev_origin[3];
 		float temporal_prev_forward[3];
 		float temporal_prev_right[3];
@@ -701,6 +714,8 @@ typedef struct {
 			uint64_t tlas_build_bytes;
 			uint64_t compacted_bytes_saved;
 			uint64_t throttled_builds;
+			uint64_t dynamic_rebuild_skips;
+			uint64_t prep_stride_skips;
 			uint64_t dispatch_count;
 			uint64_t skipped_dispatches;
 			uint64_t world_triangles;
@@ -708,7 +723,23 @@ typedef struct {
 			uint64_t masked_triangles;
 			uint64_t active_lights;
 			uint64_t history_resets;
+			uint64_t async_overlap_submits;
+			uint64_t texture_stream_flushes;
+			uint64_t texture_stream_bytes;
 		} stats;
+
+		struct {
+			float cpu_dynamic_ms;
+			float cpu_world_ms;
+			float cpu_tlas_ms;
+			float cpu_temporal_ms;
+			float cpu_dispatch_ms;
+			float cpu_copy_ms;
+			float cpu_frame_ms;
+			float gpu_trace_ms;
+			float gpu_copy_ms;
+			float gpu_frame_ms;
+		} perf;
 	} rt;
 
 	uint32_t frame_count;

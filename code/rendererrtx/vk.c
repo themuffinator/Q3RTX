@@ -65,9 +65,11 @@ static PFN_vkCmdEndRenderPass							qvkCmdEndRenderPass;
 static PFN_vkCmdNextSubpass								qvkCmdNextSubpass;
 static PFN_vkCmdPipelineBarrier							qvkCmdPipelineBarrier;
 static PFN_vkCmdPushConstants							qvkCmdPushConstants;
+static PFN_vkCmdResetQueryPool							qvkCmdResetQueryPool;
 static PFN_vkCmdSetDepthBias							qvkCmdSetDepthBias;
 static PFN_vkCmdSetScissor								qvkCmdSetScissor;
 static PFN_vkCmdSetViewport								qvkCmdSetViewport;
+static PFN_vkCmdWriteTimestamp							qvkCmdWriteTimestamp;
 static PFN_vkCreateBuffer								qvkCreateBuffer;
 static PFN_vkCreateCommandPool							qvkCreateCommandPool;
 static PFN_vkCreateDescriptorPool						qvkCreateDescriptorPool;
@@ -201,6 +203,9 @@ static qboolean s_vkSwapchainResizePending = qfalse;
 static qboolean s_vkSwapchainResizeRestarting = qfalse;
 static VkResult s_vkSwapchainResizeResult = VK_SUCCESS;
 static qboolean s_vkValidationLayerEnabled = qfalse;
+static qboolean s_vkRtDynResBlitWarned = qfalse;
+static int s_vkRtTextureBudgetFrame = -1;
+static VkDeviceSize s_vkRtTextureBudgetUsed = 0;
 
 typedef enum {
 	RTX_VK_DESC_LAYOUT_SAMPLER = 0,
@@ -256,6 +261,7 @@ typedef struct {
 	uint32_t albedoColorSpace;
 	uint32_t normalColorSpace;
 	uint32_t emissiveColorSpace;
+	int32_t albedoTextureIndex;
 	uint32_t sourceStageCount;
 } rtxRtMaterial_t;
 
@@ -264,6 +270,7 @@ typedef struct {
 	float emissiveColorScale[4];
 	float pbrParams[4];			// roughness, metallic, alphaCutoff, ior
 	uint32_t metadata[4];		// flags, albedoCS, normalCS, emissiveCS
+	uint32_t textureInfo[4];	// albedoTextureIndex, reserved[3]
 } rtxRtGpuMaterial_t;
 
 typedef struct {
@@ -271,6 +278,20 @@ typedef struct {
 	float colorType[4];		// rgb + type (0 point, 1 directional)
 	float directionSoftness[4];	// xyz + softness
 } rtxRtGpuLight_t;
+
+#define RTX_RT_MAX_WORLD_ENTITY_LIGHTS 512
+
+typedef struct {
+	const world_t *world;
+	uint32_t count;
+	qboolean hasSkySurface;
+	qboolean warnedEmpty;
+	vec3_t worldspawnColor;
+	float worldspawnAmbient;
+	rtxRtGpuLight_t lights[RTX_RT_MAX_WORLD_ENTITY_LIGHTS];
+} rtxRtWorldLightCache_t;
+
+static rtxRtWorldLightCache_t s_vkRtWorldLightCache;
 
 typedef struct {
 	rtxRtPackedVertex_t *vertices;
@@ -341,7 +362,11 @@ typedef struct {
 #define RTX_RT_DESC_BINDING_HISTORY_IN 9
 #define RTX_RT_DESC_BINDING_HISTORY_OUT 10
 #define RTX_RT_DESC_BINDING_TEMPORAL_PARAMS 11
+#define RTX_RT_DESC_BINDING_SCENE_COLOR 12
+#define RTX_RT_DESC_BINDING_SCENE_TEXTURES 13
 #define RTX_RT_MAX_DEBUG_VISUALIZER 10
+#define RTX_RT_MAX_SCENE_TEXTURES MAX_DRAWIMAGES
+#define RTX_RT_INVALID_TEXTURE_INDEX 0xFFFFFFFFu
 
 #define RTX_RT_TEMPORAL_FLAG_HISTORY_VALID ( 1u << 0 )
 #define RTX_RT_TEMPORAL_FLAG_RESET ( 1u << 1 )
@@ -355,6 +380,10 @@ static qboolean vk_rt_init( void );
 static qboolean vk_rt_ensure_pipeline( void );
 static qboolean vk_rt_ensure_output_image( void );
 static qboolean vk_rt_ensure_temporal_params_buffer( void );
+static qboolean vk_rt_ensure_timing_query_pool( void );
+static void vk_rt_read_timing_query_results( void );
+static void vk_rt_update_scalability_controller( void );
+static void vk_rt_log_perf_summary( void );
 static qboolean vk_rt_ensure_world_blas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSize frameBudgetBytes );
 static qboolean vk_rt_ensure_dynamic_blas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSize frameBudgetBytes );
 static qboolean vk_rt_build_tlas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSize frameBudgetBytes );
@@ -364,6 +393,8 @@ static qboolean vk_rt_budget_allows( VkDeviceSize bytesNeeded, VkDeviceSize *byt
 static qboolean vk_rt_create_buffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags memoryProps, qboolean needDeviceAddress, const char *debugName, rtxVkRtBuffer_t *outBuffer );
 static void vk_rt_destroy_buffer( rtxVkRtBuffer_t *buffer );
 static qboolean vk_rt_upload_buffer_data( const rtxVkRtBuffer_t *buffer, const void *src, size_t bytes );
+static qboolean vk_rt_wait_for_inflight_frames( const char *reason );
+static qboolean vk_rt_ensure_buffer_capacity( rtxVkRtBuffer_t *buffer, VkDeviceSize minSize, VkBufferUsageFlags usage, VkMemoryPropertyFlags memoryProps, qboolean needDeviceAddress, const char *debugName );
 static void vk_rt_destroy_as( rtxVkRtAccelerationStructure_t *as );
 static qboolean vk_rt_create_as( VkAccelerationStructureTypeKHR type, VkDeviceSize size, const char *debugName, rtxVkRtAccelerationStructure_t *outAs );
 static qboolean vk_rt_ensure_scratch_buffer( VkDeviceSize minSize );
@@ -390,6 +421,7 @@ static qboolean vk_rt_append_beam_entity_geometry( rtxRtCpuGeometry_t *geometry,
 static qboolean vk_rt_append_poly_geometry( rtxRtCpuGeometry_t *geometry, const srfPoly_t *poly );
 static qboolean vk_rt_append_dynamic_model_entity_geometry( rtxRtCpuGeometry_t *geometry, const trRefEntity_t *ent, uint32_t *outModelCount );
 static qboolean vk_rt_poly_is_mark_decal( const srfPoly_t *poly );
+static uint32_t vk_rt_estimate_dynamic_scene_signature( vec3_t outCentroid, uint32_t *outModelCount, uint32_t *outEffectCount, float quantStep );
 static void vk_rt_apply_effect_material_tuning( rtxRtCpuGeometry_t *geometry, uint32_t materialIndex, qboolean particleLike, qboolean decalLike );
 static void vk_rt_transform_geometry_range( rtxRtCpuGeometry_t *geometry, uint32_t firstVertex, const trRefEntity_t *ent );
 static qboolean vk_rt_generate_tangents( rtxRtCpuGeometry_t *geometry );
@@ -398,6 +430,12 @@ static qboolean vk_rt_ensure_descriptor_resources( void );
 static qboolean vk_rt_update_descriptor_set( void );
 static qboolean vk_rt_upload_material_buffer( const rtxRtMaterial_t *materials, uint32_t materialCount, rtxVkRtBuffer_t *targetBuffer, uint32_t *outMaterialCount, const char *debugName );
 static qboolean vk_rt_update_light_buffer( void );
+static void vk_rt_reset_world_light_cache( void );
+static void vk_rt_rebuild_world_light_cache( void );
+static uint32_t vk_rt_append_world_entity_lights( rtxRtGpuLight_t *lights, uint32_t count, uint32_t maxLights );
+static qboolean vk_rt_world_has_sky_surface( void );
+static void vk_rt_estimate_world_bounds( vec3_t center, float *radius );
+static void vk_rt_resolve_sun_params( vec3_t outDirection, vec3_t outColor, qboolean *outFallbackFromSky );
 static qboolean vk_rt_build_sbt( void );
 static VkDeviceSize vk_rt_query_triangles_build_bytes( uint32_t vertexCount, uint32_t indexCount, VkBuildAccelerationStructureFlagsKHR buildFlags );
 static VkDeviceSize vk_rt_query_tlas_build_bytes( uint32_t instanceCount, VkBuildAccelerationStructureFlagsKHR buildFlags );
@@ -417,8 +455,10 @@ static qboolean vk_rt_material_name_contains_token( const char *name, const char
 static float vk_rt_material_alpha_cutoff_from_state_bits( unsigned stateBits );
 static rtxRtColorSpace_t vk_rt_material_albedo_color_space( const image_t *image );
 static rtxRtColorSpace_t vk_rt_material_data_color_space( const image_t *image );
+static int32_t vk_rt_image_to_scene_texture_index( const image_t *image );
 static void vk_rt_translate_shader_to_material( const shader_t *shader, rtxRtMaterial_t *material );
 static void vk_rt_apply_material_overrides( rtxRtMaterial_t *material );
+static VkSampler vk_find_sampler( const Vk_Sampler_Def *def );
 
 static int vk_lifetime_debug_level( void )
 {
@@ -482,20 +522,616 @@ static int vk_rt_debug_visualizer_mode( void )
 	return rtx_rt_debug_visualizer->integer;
 }
 
-static int vk_rt_as_build_budget_mb( void )
+static int vk_rt_quality_preset( void )
 {
-	if ( !rtx_rt_as_build_budget_mb ) {
+	if ( !rtx_rt_quality_preset ) {
 		return 0;
 	}
-	return rtx_rt_as_build_budget_mb->integer;
+	return Com_Clamp( 0, 4, rtx_rt_quality_preset->integer );
+}
+
+static qboolean vk_rt_adaptive_budget_enabled( void )
+{
+	if ( !rtx_rt_adaptive_budget ) {
+		return qfalse;
+	}
+	return rtx_rt_adaptive_budget->integer ? qtrue : qfalse;
+}
+
+static float vk_rt_target_frame_ms( void )
+{
+	static const float presetTarget[5] = { 12.0f, 16.6f, 13.8f, 11.1f, 8.3f };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetTarget[preset];
+	}
+	if ( !rtx_rt_target_frame_ms ) {
+		return 12.0f;
+	}
+	return Com_Clamp( 4.0f, 50.0f, rtx_rt_target_frame_ms->value );
+}
+
+static float vk_rt_budget_response( void )
+{
+	if ( !rtx_rt_budget_response ) {
+		return 0.18f;
+	}
+	return Com_Clamp( 0.01f, 1.0f, rtx_rt_budget_response->value );
+}
+
+static float vk_rt_budget_min_scale( void )
+{
+	static const float presetMinScale[5] = { 0.45f, 0.40f, 0.45f, 0.50f, 0.60f };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetMinScale[preset];
+	}
+	if ( !rtx_rt_budget_min_scale ) {
+		return 0.45f;
+	}
+	return Com_Clamp( 0.1f, 1.0f, rtx_rt_budget_min_scale->value );
+}
+
+static float vk_rt_budget_max_scale( void )
+{
+	static const float presetMaxScale[5] = { 1.25f, 1.00f, 1.10f, 1.25f, 1.40f };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetMaxScale[preset];
+	}
+	if ( !rtx_rt_budget_max_scale ) {
+		return 1.25f;
+	}
+	return Com_Clamp( 1.0f, 2.0f, rtx_rt_budget_max_scale->value );
+}
+
+static int vk_rt_perf_timing_mode( void )
+{
+	if ( !rtx_rt_perf_timing ) {
+		return 0;
+	}
+	return Com_Clamp( 0, 2, rtx_rt_perf_timing->integer );
+}
+
+static int vk_rt_perf_interval_frames( void )
+{
+	if ( !rtx_rt_perf_interval ) {
+		return 120;
+	}
+	return Com_Clamp( 1, 4096, rtx_rt_perf_interval->integer );
+}
+
+static qboolean vk_rt_dynamic_resolution_enabled( void )
+{
+	if ( !rtx_rt_dynamic_resolution ) {
+		return qfalse;
+	}
+	return rtx_rt_dynamic_resolution->integer ? qtrue : qfalse;
+}
+
+static float vk_rt_dynamic_resolution_min_scale( void )
+{
+	static const float presetMin[5] = { 0.60f, 0.55f, 0.65f, 0.75f, 0.85f };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetMin[preset];
+	}
+	if ( !rtx_rt_dynamic_resolution_min ) {
+		return 0.60f;
+	}
+	return Com_Clamp( 0.25f, 1.0f, rtx_rt_dynamic_resolution_min->value );
+}
+
+static float vk_rt_dynamic_resolution_max_scale( void )
+{
+	static const float presetMax[5] = { 1.00f, 0.85f, 0.95f, 1.00f, 1.00f };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetMax[preset];
+	}
+	if ( !rtx_rt_dynamic_resolution_max ) {
+		return 1.00f;
+	}
+	return Com_Clamp( 0.25f, 1.5f, rtx_rt_dynamic_resolution_max->value );
+}
+
+static float vk_rt_dynamic_resolution_rate( void )
+{
+	if ( !rtx_rt_dynamic_resolution_rate ) {
+		return 0.08f;
+	}
+	return Com_Clamp( 0.01f, 1.0f, rtx_rt_dynamic_resolution_rate->value );
+}
+
+static qboolean vk_rt_async_overlap_enabled( void )
+{
+	if ( !rtx_rt_async_overlap ) {
+		return qfalse;
+	}
+	return rtx_rt_async_overlap->integer ? qtrue : qfalse;
+}
+
+static int vk_rt_as_rebuild_interval( void )
+{
+	static const int presetInterval[5] = { 1, 3, 2, 1, 1 };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetInterval[preset];
+	}
+	if ( !rtx_rt_as_rebuild_interval ) {
+		return 1;
+	}
+	return Com_Clamp( 1, 16, rtx_rt_as_rebuild_interval->integer );
+}
+
+static float vk_rt_as_dirty_threshold( void )
+{
+	if ( !rtx_rt_as_dirty_threshold ) {
+		return 6.0f;
+	}
+	return Com_Clamp( 0.0f, 4096.0f, rtx_rt_as_dirty_threshold->value );
+}
+
+static int vk_rt_texture_stream_budget_mb( void )
+{
+	if ( !rtx_rt_texture_stream_budget_mb ) {
+		return 96;
+	}
+	return Com_Clamp( 0, 2048, rtx_rt_texture_stream_budget_mb->integer );
+}
+
+static qboolean vk_rt_texture_stream_stats_enabled( void )
+{
+	if ( !rtx_rt_texture_stream_stats ) {
+		return qfalse;
+	}
+	return rtx_rt_texture_stream_stats->integer ? qtrue : qfalse;
+}
+
+static int vk_rt_prep_frame_stride( void )
+{
+	static const int presetStride[5] = { 1, 3, 2, 1, 1 };
+	int preset = vk_rt_quality_preset();
+
+	if ( preset > 0 ) {
+		return presetStride[preset];
+	}
+	if ( !rtx_rt_prep_frame_stride ) {
+		return 1;
+	}
+	return Com_Clamp( 1, 8, rtx_rt_prep_frame_stride->integer );
+}
+
+static int64_t vk_rt_now_microseconds( void )
+{
+	if ( ri.Microseconds ) {
+		return ri.Microseconds();
+	}
+	return (int64_t)ri.Milliseconds() * 1000;
+}
+
+static float vk_rt_elapsed_ms( int64_t startUs, int64_t endUs )
+{
+	if ( endUs <= startUs ) {
+		return 0.0f;
+	}
+	return (float)( (double)( endUs - startUs ) * ( 1.0 / 1000.0 ) );
+}
+
+static uint32_t vk_rt_hash_mix_u32( uint32_t hash, uint32_t value )
+{
+	return ( hash ^ value ) * 16777619u;
+}
+
+static uint32_t vk_rt_hash_quantized_float( uint32_t hash, float value, float quantStep )
+{
+	const float step = ( quantStep > 0.0f ) ? quantStep : 1.0f;
+	const float scaled = value / step;
+	const int32_t quantized = (int32_t)( scaled >= 0.0f ? floorf( scaled + 0.5f ) : ceilf( scaled - 0.5f ) );
+	return vk_rt_hash_mix_u32( hash, (uint32_t)quantized );
+}
+
+static qboolean vk_rt_entity_visible_in_current_view( const trRefEntity_t *ent )
+{
+	if ( !ent ) {
+		return qfalse;
+	}
+
+	// Match legacy visibility behavior for first/third-person entities.
+	if ( ( ent->e.renderfx & RF_FIRST_PERSON ) && ( backEnd.viewParms.portalView != PV_NONE ) ) {
+		return qfalse;
+	}
+	if ( ( ent->e.renderfx & RF_THIRD_PERSON ) && ( backEnd.viewParms.portalView == PV_NONE ) ) {
+		return qfalse;
+	}
+
+	return qtrue;
+}
+
+static uint32_t vk_rt_estimate_dynamic_scene_signature( vec3_t outCentroid, uint32_t *outModelCount, uint32_t *outEffectCount, float quantStep )
+{
+	uint32_t hash = 2166136261u;
+	vec3_t sumOrigin = { 0.0f, 0.0f, 0.0f };
+	uint32_t sampleCount = 0;
+	const float originQuant = MAX( 1.0f, quantStep );
+	const float axisQuant = 0.02f;
+	int i;
+
+	if ( outModelCount ) {
+		*outModelCount = 0;
+	}
+	if ( outEffectCount ) {
+		*outEffectCount = 0;
+	}
+
+	for ( i = 0; i < backEnd.refdef.num_entities; i++ ) {
+		const trRefEntity_t *ent = &backEnd.refdef.entities[i];
+		const refEntity_t *ref = &ent->e;
+		vec3_t sampledOrigin;
+		qboolean include = qfalse;
+		uint32_t modelHandle = 0u;
+
+		if ( !vk_rt_entity_visible_in_current_view( ent ) ) {
+			continue;
+		}
+
+		VectorCopy( ref->origin, sampledOrigin );
+
+		switch ( ref->reType ) {
+		case RT_MODEL:
+			if ( ref->hModel <= 0 ) {
+				continue;
+			}
+			include = qtrue;
+			modelHandle = (uint32_t)ref->hModel;
+			if ( outModelCount ) {
+				*outModelCount += 1u;
+			}
+			hash = vk_rt_hash_mix_u32( hash, (uint32_t)ref->frame );
+			hash = vk_rt_hash_mix_u32( hash, (uint32_t)ref->oldframe );
+			hash = vk_rt_hash_quantized_float( hash, ref->backlerp, 0.01f );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[0][0], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[0][1], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[0][2], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[1][0], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[1][1], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[1][2], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[2][0], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[2][1], axisQuant );
+			hash = vk_rt_hash_quantized_float( hash, ref->axis[2][2], axisQuant );
+			break;
+		case RT_SPRITE:
+		case RT_BEAM:
+		case RT_RAIL_CORE:
+		case RT_RAIL_RINGS:
+		case RT_LIGHTNING:
+			include = qtrue;
+			if ( outEffectCount ) {
+				*outEffectCount += 1u;
+			}
+			if ( ref->reType == RT_BEAM || ref->reType == RT_RAIL_CORE ||
+				ref->reType == RT_RAIL_RINGS || ref->reType == RT_LIGHTNING ) {
+				VectorAdd( ref->origin, ref->oldorigin, sampledOrigin );
+				VectorScale( sampledOrigin, 0.5f, sampledOrigin );
+			}
+			break;
+		default:
+			break;
+		}
+
+		if ( !include ) {
+			continue;
+		}
+
+		hash = vk_rt_hash_mix_u32( hash, (uint32_t)ref->reType );
+		hash = vk_rt_hash_mix_u32( hash, modelHandle );
+		hash = vk_rt_hash_mix_u32( hash, (uint32_t)ref->renderfx );
+		hash = vk_rt_hash_quantized_float( hash, sampledOrigin[0], originQuant );
+		hash = vk_rt_hash_quantized_float( hash, sampledOrigin[1], originQuant );
+		hash = vk_rt_hash_quantized_float( hash, sampledOrigin[2], originQuant );
+
+		VectorAdd( sumOrigin, sampledOrigin, sumOrigin );
+		sampleCount++;
+	}
+
+	hash = vk_rt_hash_mix_u32( hash, (uint32_t)backEnd.refdef.numPolys );
+
+	if ( sampleCount > 0 ) {
+		const float invCount = 1.0f / (float)sampleCount;
+		VectorScale( sumOrigin, invCount, outCentroid );
+	} else {
+		VectorCopy( vk.rt.dynamic_centroid_prev, outCentroid );
+	}
+
+	return hash;
+}
+
+static qboolean vk_rt_supports_reconstruction_blit( void )
+{
+	VkFormatProperties srcProps;
+	VkFormatProperties dstProps;
+
+	qvkGetPhysicalDeviceFormatProperties( vk.physical_device, vk.rt.output_format, &srcProps );
+	if ( ( srcProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT ) == 0 ) {
+		return qfalse;
+	}
+
+	qvkGetPhysicalDeviceFormatProperties( vk.physical_device, vk.color_format, &dstProps );
+	if ( ( dstProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT ) == 0 ) {
+		return qfalse;
+	}
+
+	return qtrue;
+}
+
+static qboolean vk_rt_ensure_timing_query_pool( void )
+{
+	VkQueryPoolCreateInfo queryInfo;
+	VkResult result;
+
+	if ( vk_rt_perf_timing_mode() <= 0 ) {
+		if ( vk.rt.timing_query_pool != VK_NULL_HANDLE ) {
+			qvkDestroyQueryPool( vk.device, vk.rt.timing_query_pool, NULL );
+			vk.rt.timing_query_pool = VK_NULL_HANDLE;
+			vk.rt.timing_query_count = 0;
+		}
+		return qtrue;
+	}
+
+	if ( !qvkCreateQueryPool || !qvkCmdResetQueryPool || !qvkCmdWriteTimestamp || !qvkGetQueryPoolResults ) {
+		return qtrue;
+	}
+
+	if ( vk.rt.timing_query_pool != VK_NULL_HANDLE ) {
+		return qtrue;
+	}
+
+	vk.rt.timing_query_stride = 4;
+	vk.rt.timing_query_count = vk.rt.timing_query_stride * 2u;
+
+	Com_Memset( &queryInfo, 0, sizeof( queryInfo ) );
+	queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	queryInfo.queryCount = vk.rt.timing_query_count;
+
+	result = qvkCreateQueryPool( vk.device, &queryInfo, NULL, &vk.rt.timing_query_pool );
+	if ( result != VK_SUCCESS ) {
+		ri.Printf( PRINT_WARNING, "RTX RT: failed to create timing query pool: %s\n", vk_result_string( result ) );
+		vk.rt.timing_query_pool = VK_NULL_HANDLE;
+		vk.rt.timing_query_count = 0;
+		return qtrue;
+	}
+
+	return qtrue;
+}
+
+static void vk_rt_read_timing_query_results( void )
+{
+	uint64_t queryData[8];
+	const uint32_t currentSlot = (uint32_t)( tr.frameCount & 1 );
+	const uint32_t previousSlot = currentSlot ^ 1u;
+	const uint32_t baseQuery = previousSlot * vk.rt.timing_query_stride;
+	VkResult result;
+	double toMs;
+	uint64_t traceStart;
+	uint64_t traceEnd;
+	uint64_t copyEnd;
+	uint64_t frameEnd;
+	qboolean complete;
+
+	if ( vk_rt_perf_timing_mode() <= 0 ) {
+		return;
+	}
+
+	if ( vk.rt.timing_query_pool == VK_NULL_HANDLE || vk.rt.timing_query_stride < 4 || vk.rt.timing_query_count < 8 ) {
+		return;
+	}
+
+	Com_Memset( queryData, 0, sizeof( queryData ) );
+	result = qvkGetQueryPoolResults(
+		vk.device,
+		vk.rt.timing_query_pool,
+		baseQuery,
+		vk.rt.timing_query_stride,
+		sizeof( queryData ),
+		queryData,
+		sizeof( uint64_t ) * 2,
+		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT );
+	if ( result != VK_SUCCESS && result != VK_NOT_READY ) {
+		return;
+	}
+
+	complete = ( queryData[1] != 0u && queryData[3] != 0u && queryData[5] != 0u && queryData[7] != 0u ) ? qtrue : qfalse;
+	if ( !complete ) {
+		return;
+	}
+
+	traceStart = queryData[0];
+	traceEnd = queryData[2];
+	copyEnd = queryData[4];
+	frameEnd = queryData[6];
+	toMs = (double)MAX( 0.0f, vk.rt.gpu_timestamp_period_ns ) * ( 1.0 / 1000000.0 );
+
+	if ( traceEnd >= traceStart ) {
+		vk.rt.perf.gpu_trace_ms = (float)( (double)( traceEnd - traceStart ) * toMs );
+	}
+	if ( copyEnd >= traceEnd ) {
+		vk.rt.perf.gpu_copy_ms = (float)( (double)( copyEnd - traceEnd ) * toMs );
+	}
+	if ( frameEnd >= traceStart ) {
+		vk.rt.perf.gpu_frame_ms = (float)( (double)( frameEnd - traceStart ) * toMs );
+	}
+}
+
+static void vk_rt_update_scalability_controller( void )
+{
+	float sourceFrameMs;
+	float targetFrameMs;
+	float response;
+	float minScale;
+	float maxScale;
+
+	sourceFrameMs = ( vk_rt_perf_timing_mode() > 0 && vk.rt.perf.gpu_frame_ms > 0.0f ) ?
+		vk.rt.perf.gpu_frame_ms : vk.rt.perf.cpu_frame_ms;
+	targetFrameMs = vk_rt_target_frame_ms();
+	response = vk_rt_budget_response();
+	minScale = vk_rt_budget_min_scale();
+	maxScale = vk_rt_budget_max_scale();
+
+	if ( minScale > maxScale ) {
+		float tmp = minScale;
+		minScale = maxScale;
+		maxScale = tmp;
+	}
+
+	if ( !vk_rt_adaptive_budget_enabled() ) {
+		vk.rt.adaptive_budget_scale = 1.0f;
+	} else if ( sourceFrameMs > 0.0f && targetFrameMs > 0.0f ) {
+		const float delta = ( targetFrameMs - sourceFrameMs ) / targetFrameMs;
+		vk.rt.adaptive_budget_scale += response * delta;
+		vk.rt.adaptive_budget_scale = Com_Clamp( minScale, maxScale, vk.rt.adaptive_budget_scale );
+	} else {
+		vk.rt.adaptive_budget_scale = Com_Clamp( minScale, maxScale, vk.rt.adaptive_budget_scale );
+	}
+
+	if ( vk_rt_dynamic_resolution_enabled() ) {
+		float dynMin = vk_rt_dynamic_resolution_min_scale();
+		float dynMax = vk_rt_dynamic_resolution_max_scale();
+		float dynRate = vk_rt_dynamic_resolution_rate();
+
+		if ( dynMin > dynMax ) {
+			float tmp = dynMin;
+			dynMin = dynMax;
+			dynMax = tmp;
+		}
+
+		if ( sourceFrameMs > 0.0f && targetFrameMs > 0.0f ) {
+			const float delta = ( targetFrameMs - sourceFrameMs ) / targetFrameMs;
+			vk.rt.dynamic_resolution_target_scale += response * delta;
+		} else {
+			vk.rt.dynamic_resolution_target_scale = dynMax;
+		}
+
+		vk.rt.dynamic_resolution_target_scale = Com_Clamp( dynMin, dynMax, vk.rt.dynamic_resolution_target_scale );
+		vk.rt.dynamic_resolution_scale += ( vk.rt.dynamic_resolution_target_scale - vk.rt.dynamic_resolution_scale ) * dynRate;
+		vk.rt.dynamic_resolution_scale = Com_Clamp( dynMin, dynMax, vk.rt.dynamic_resolution_scale );
+	} else {
+		vk.rt.dynamic_resolution_target_scale = 1.0f;
+		vk.rt.dynamic_resolution_scale = 1.0f;
+	}
+}
+
+static void vk_rt_log_perf_summary( void )
+{
+	static uint64_t lastTextureBytes = 0;
+	static uint64_t lastTextureFlushes = 0;
+	static uint64_t lastAsyncSubmits = 0;
+	const int timingMode = vk_rt_perf_timing_mode();
+	const int interval = vk_rt_perf_interval_frames();
+	const qboolean wantTextureStats = vk_rt_texture_stream_stats_enabled();
+	const qboolean printPerFrame = ( timingMode >= 2 ) ? qtrue : qfalse;
+	const qboolean printPeriodic = ( ( tr.frameCount % interval ) == 0 ) ? qtrue : qfalse;
+
+	if ( timingMode <= 0 && !wantTextureStats ) {
+		return;
+	}
+	if ( !printPerFrame && !printPeriodic ) {
+		return;
+	}
+
+	if ( timingMode > 0 ) {
+		ri.Printf( PRINT_ALL,
+			"RTX RT perf: cpu(ms) dyn=%.3f world=%.3f tlas=%.3f temporal=%.3f dispatch=%.3f copy=%.3f frame=%.3f | gpu(ms) trace=%.3f copy=%.3f frame=%.3f | scale budget=%.3f dynres=%.3f (%ux%u)\n",
+			vk.rt.perf.cpu_dynamic_ms,
+			vk.rt.perf.cpu_world_ms,
+			vk.rt.perf.cpu_tlas_ms,
+			vk.rt.perf.cpu_temporal_ms,
+			vk.rt.perf.cpu_dispatch_ms,
+			vk.rt.perf.cpu_copy_ms,
+			vk.rt.perf.cpu_frame_ms,
+			vk.rt.perf.gpu_trace_ms,
+			vk.rt.perf.gpu_copy_ms,
+			vk.rt.perf.gpu_frame_ms,
+			vk.rt.adaptive_budget_scale,
+			vk.rt.dynamic_resolution_scale,
+			vk.rt.output_width,
+			vk.rt.output_height );
+	}
+
+	if ( wantTextureStats ) {
+		const uint64_t bytesDelta = vk.rt.stats.texture_stream_bytes - lastTextureBytes;
+		const uint64_t flushDelta = vk.rt.stats.texture_stream_flushes - lastTextureFlushes;
+		const uint64_t asyncDelta = vk.rt.stats.async_overlap_submits - lastAsyncSubmits;
+		const float mbDelta = (float)( (double)bytesDelta / ( 1024.0 * 1024.0 ) );
+
+		ri.Printf( PRINT_ALL,
+			"RTX RT stream: uploads=%.2fMB flushes=%llu asyncSubmits=%llu budget=%dMB staging=%lluKB rebuildSkips=%llu prepStrideSkips=%llu\n",
+			mbDelta,
+			(unsigned long long)flushDelta,
+			(unsigned long long)asyncDelta,
+			vk_rt_texture_stream_budget_mb(),
+			(unsigned long long)( vk_world.staging_buffer_size / 1024u ),
+			(unsigned long long)vk.rt.stats.dynamic_rebuild_skips,
+			(unsigned long long)vk.rt.stats.prep_stride_skips );
+
+		lastTextureBytes = vk.rt.stats.texture_stream_bytes;
+		lastTextureFlushes = vk.rt.stats.texture_stream_flushes;
+		lastAsyncSubmits = vk.rt.stats.async_overlap_submits;
+	}
+}
+
+static int vk_rt_as_build_budget_mb( void )
+{
+	static const int presetBudget[5] = { 96, 48, 96, 160, 256 };
+	int preset = vk_rt_quality_preset();
+	int base;
+	float scale = 1.0f;
+
+	if ( preset > 0 ) {
+		base = presetBudget[preset];
+	} else if ( rtx_rt_as_build_budget_mb ) {
+		base = rtx_rt_as_build_budget_mb->integer;
+	} else {
+		base = 0;
+	}
+
+	if ( base <= 0 ) {
+		return 0;
+	}
+
+	if ( vk_rt_adaptive_budget_enabled() ) {
+		scale = Com_Clamp( vk_rt_budget_min_scale(), vk_rt_budget_max_scale(), vk.rt.adaptive_budget_scale );
+	}
+
+	return Com_Clamp( 1, 4096, (int)( (float)base * scale ) );
 }
 
 static int vk_rt_as_instance_budget( void )
 {
-	if ( !rtx_rt_as_instance_budget ) {
-		return 1024;
+	static const int presetInstances[5] = { 1024, 384, 768, 1536, 3072 };
+	int preset = vk_rt_quality_preset();
+	int base;
+	float scale = 1.0f;
+
+	if ( preset > 0 ) {
+		base = presetInstances[preset];
+	} else if ( rtx_rt_as_instance_budget ) {
+		base = rtx_rt_as_instance_budget->integer;
+	} else {
+		base = 1024;
 	}
-	return rtx_rt_as_instance_budget->integer;
+
+	if ( vk_rt_adaptive_budget_enabled() ) {
+		scale = Com_Clamp( vk_rt_budget_min_scale(), vk_rt_budget_max_scale(), vk.rt.adaptive_budget_scale );
+	}
+
+	return Com_Clamp( 64, 16384, (int)( (float)base * scale ) );
 }
 
 static qboolean vk_rt_as_compaction_enabled( void )
@@ -738,6 +1374,14 @@ static qboolean vk_rt_legacy_color_compat_enabled( void )
 	return rtx_rt_legacy_color_compat->integer ? qtrue : qfalse;
 }
 
+static float vk_rt_world_light_scale( void )
+{
+	if ( !rtx_rt_world_light_scale ) {
+		return 0.35f;
+	}
+	return MAX( 0.0f, rtx_rt_world_light_scale->value );
+}
+
 static float vk_rt_legacy_intensity_scale( void )
 {
 	if ( !r_intensity ) {
@@ -852,10 +1496,24 @@ static float vk_rt_refractive_ior( void )
 
 static uint32_t vk_rt_max_lights( void )
 {
-	if ( !rtx_rt_max_lights ) {
-		return 64u;
+	static const int presetLights[5] = { 64, 24, 48, 64, 96 };
+	int preset = vk_rt_quality_preset();
+	int base;
+	float scale = 1.0f;
+
+	if ( preset > 0 ) {
+		base = presetLights[preset];
+	} else if ( rtx_rt_max_lights ) {
+		base = rtx_rt_max_lights->integer;
+	} else {
+		base = 64;
 	}
-	return (uint32_t)Com_Clamp( 1, 256, rtx_rt_max_lights->integer );
+
+	if ( vk_rt_adaptive_budget_enabled() ) {
+		scale = Com_Clamp( vk_rt_budget_min_scale(), vk_rt_budget_max_scale(), vk.rt.adaptive_budget_scale );
+	}
+
+	return (uint32_t)Com_Clamp( 8, 256, (int)( (float)base * scale ) );
 }
 
 static const char *vk_rt_mode_name( int mode )
@@ -891,8 +1549,22 @@ static void vk_rt_reset_state( void )
 	vk.rt.temporal_prev_rdflags = 0;
 	vk.rt.temporal_prev_stereo_frame = 0;
 	vk.rt.temporal_exposure = vk_rt_exposure_manual();
+	vk.rt.adaptive_budget_scale = 1.0f;
+	vk.rt.dynamic_resolution_scale = 1.0f;
+	vk.rt.dynamic_resolution_target_scale = 1.0f;
+	vk.rt.dynamic_scene_signature = 0u;
+	vk.rt.dynamic_last_rebuild_frame = -1;
+	vk.rt.gpu_timestamp_period_ns = 1.0f;
+	vk.rt.timing_query_pool = VK_NULL_HANDLE;
+	vk.rt.timing_query_count = 0;
+	vk.rt.timing_query_stride = 4;
 	VectorClear( vk.rt.dynamic_centroid_current );
 	VectorClear( vk.rt.dynamic_centroid_prev );
+	VectorClear( vk.rt.dynamic_last_rebuild_centroid );
+	s_vkRtDynResBlitWarned = qfalse;
+	s_vkRtTextureBudgetFrame = -1;
+	s_vkRtTextureBudgetUsed = 0;
+	vk_rt_reset_world_light_cache();
 }
 
 static VkDeviceSize vk_rt_align_up( VkDeviceSize value, VkDeviceSize alignment )
@@ -901,6 +1573,37 @@ static VkDeviceSize vk_rt_align_up( VkDeviceSize value, VkDeviceSize alignment )
 		return value;
 	}
 	return ( value + alignment - 1 ) & ~( alignment - 1 );
+}
+
+static qboolean vk_rt_wait_for_inflight_frames( const char *reason )
+{
+	VkFence fences[ NUM_COMMAND_BUFFERS ];
+	uint32_t count = 0;
+	uint32_t i;
+	VkResult result;
+
+	if ( !vk.active || vk.device == VK_NULL_HANDLE ) {
+		return qtrue;
+	}
+
+	for ( i = 0; i < NUM_COMMAND_BUFFERS; i++ ) {
+		if ( vk.tess[i].waitForFence && vk.tess[i].rendering_finished_fence != VK_NULL_HANDLE ) {
+			fences[count++] = vk.tess[i].rendering_finished_fence;
+		}
+	}
+
+	if ( count == 0 ) {
+		return qtrue;
+	}
+
+	result = qvkWaitForFences( vk.device, count, fences, VK_TRUE, 1000000000000ULL );
+	if ( result != VK_SUCCESS ) {
+		ri.Printf( PRINT_ERROR, "RTX RT: wait-for-fences failed before %s: %s\n",
+			reason ? reason : "resource rebuild", vk_result_string( result ) );
+		return qfalse;
+	}
+
+	return qtrue;
 }
 
 static uint32_t vk_rt_clamped_visualizer_mode( void )
@@ -1046,17 +1749,77 @@ static void vk_rt_destroy_buffer( rtxVkRtBuffer_t *buffer )
 	Com_Memset( buffer, 0, sizeof( *buffer ) );
 }
 
+static qboolean vk_rt_ensure_buffer_capacity( rtxVkRtBuffer_t *buffer, VkDeviceSize minSize, VkBufferUsageFlags usage, VkMemoryPropertyFlags memoryProps, qboolean needDeviceAddress, const char *debugName )
+{
+	VkDeviceSize allocSize;
+
+	if ( !buffer ) {
+		return qfalse;
+	}
+
+	allocSize = ( minSize > 0 ) ? minSize : 1;
+
+	if ( buffer->buffer != VK_NULL_HANDLE && buffer->memory != VK_NULL_HANDLE ) {
+		if ( buffer->size >= allocSize && ( !needDeviceAddress || buffer->address != 0 ) ) {
+			return qtrue;
+		}
+
+		if ( buffer->size > 0 && buffer->size <= ( (VkDeviceSize)-1 ) / 2 ) {
+			VkDeviceSize grown = buffer->size * 2;
+			if ( grown > allocSize ) {
+				allocSize = grown;
+			}
+		}
+
+		if ( !vk_rt_wait_for_inflight_frames( debugName ) ) {
+			return qfalse;
+		}
+		vk_rt_destroy_buffer( buffer );
+	}
+
+	return vk_rt_create_buffer(
+		allocSize,
+		usage,
+		memoryProps,
+		needDeviceAddress,
+		debugName,
+		buffer );
+}
+
 static qboolean vk_rt_upload_buffer_data( const rtxVkRtBuffer_t *buffer, const void *src, size_t bytes )
 {
 	void *mapped = NULL;
 	VkResult result;
 	VkMappedMemoryRange range;
+	VkDeviceSize uploadSize;
+	VkDeviceSize atomSize = 1;
+	VkDeviceSize flushSize;
+	VkPhysicalDeviceProperties props;
 
 	if ( !buffer || buffer->memory == VK_NULL_HANDLE || !src || bytes == 0 ) {
 		return qfalse;
 	}
 
-	result = qvkMapMemory( vk.device, buffer->memory, 0, bytes, 0, &mapped );
+	uploadSize = (VkDeviceSize)bytes;
+	if ( uploadSize > buffer->size ) {
+		ri.Printf( PRINT_ERROR, "RTX RT: upload size %llu exceeds buffer size %llu\n",
+			(unsigned long long)uploadSize, (unsigned long long)buffer->size );
+		return qfalse;
+	}
+
+	if ( qvkGetPhysicalDeviceProperties ) {
+		qvkGetPhysicalDeviceProperties( vk.physical_device, &props );
+		if ( props.limits.nonCoherentAtomSize > 0 ) {
+			atomSize = props.limits.nonCoherentAtomSize;
+		}
+	}
+
+	flushSize = vk_rt_align_up( uploadSize, atomSize );
+	if ( flushSize > buffer->size ) {
+		flushSize = buffer->size;
+	}
+
+	result = qvkMapMemory( vk.device, buffer->memory, 0, flushSize, 0, &mapped );
 	if ( result != VK_SUCCESS ) {
 		ri.Printf( PRINT_ERROR, "RTX RT: failed to map upload buffer: %s\n", vk_result_string( result ) );
 		return qfalse;
@@ -1068,8 +1831,14 @@ static qboolean vk_rt_upload_buffer_data( const rtxVkRtBuffer_t *buffer, const v
 	range.pNext = NULL;
 	range.memory = buffer->memory;
 	range.offset = 0;
-	range.size = bytes;
-	qvkFlushMappedMemoryRanges( vk.device, 1, &range );
+	range.size = flushSize;
+
+	result = qvkFlushMappedMemoryRanges( vk.device, 1, &range );
+	if ( result != VK_SUCCESS ) {
+		ri.Printf( PRINT_ERROR, "RTX RT: failed to flush upload buffer: %s\n", vk_result_string( result ) );
+		qvkUnmapMemory( vk.device, buffer->memory );
+		return qfalse;
+	}
 
 	qvkUnmapMemory( vk.device, buffer->memory );
 	return qtrue;
@@ -1101,11 +1870,15 @@ static qboolean vk_rt_upload_material_buffer( const rtxRtMaterial_t *materials, 
 		dst->pbrParams[1] = src->metallic;
 		dst->pbrParams[2] = src->alphaCutoff;
 		dst->pbrParams[3] = vk_rt_refractive_ior();
-		dst->metadata[0] = src->flags;
-		dst->metadata[1] = src->albedoColorSpace;
-		dst->metadata[2] = src->normalColorSpace;
-		dst->metadata[3] = src->emissiveColorSpace;
-	}
+			dst->metadata[0] = src->flags;
+			dst->metadata[1] = src->albedoColorSpace;
+			dst->metadata[2] = src->normalColorSpace;
+			dst->metadata[3] = src->emissiveColorSpace;
+			dst->textureInfo[0] = ( src->albedoTextureIndex >= 0 ) ? (uint32_t)src->albedoTextureIndex : RTX_RT_INVALID_TEXTURE_INDEX;
+			dst->textureInfo[1] = 0u;
+			dst->textureInfo[2] = 0u;
+			dst->textureInfo[3] = 0u;
+		}
 
 	if ( materialCount == 0 ) {
 		gpuMaterials[0].baseColor[0] = 1.0f;
@@ -1114,16 +1887,16 @@ static qboolean vk_rt_upload_material_buffer( const rtxRtMaterial_t *materials, 
 		gpuMaterials[0].baseColor[3] = 1.0f;
 		gpuMaterials[0].pbrParams[0] = 0.85f;
 		gpuMaterials[0].pbrParams[3] = vk_rt_refractive_ior();
+		gpuMaterials[0].textureInfo[0] = RTX_RT_INVALID_TEXTURE_INDEX;
 	}
 
-	vk_rt_destroy_buffer( targetBuffer );
-	if ( !vk_rt_create_buffer(
+	if ( !vk_rt_ensure_buffer_capacity(
+		targetBuffer,
 		(VkDeviceSize)uploadBytes,
 		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		qfalse,
-		debugName,
-		targetBuffer ) ) {
+		debugName ) ) {
 		ri.Free( gpuMaterials );
 		return qfalse;
 	}
@@ -1140,6 +1913,410 @@ static qboolean vk_rt_upload_material_buffer( const rtxRtMaterial_t *materials, 
 	return qtrue;
 }
 
+static qboolean vk_rt_parse_entity_vec3( const char *text, vec3_t outVec )
+{
+	float x, y, z;
+
+	if ( !text || !outVec ) {
+		return qfalse;
+	}
+
+	if ( sscanf( text, "%f %f %f", &x, &y, &z ) != 3 ) {
+		return qfalse;
+	}
+
+	outVec[0] = x;
+	outVec[1] = y;
+	outVec[2] = z;
+	return qtrue;
+}
+
+static qboolean vk_rt_parse_entity_light_value( const char *text, float *outValue )
+{
+	float v0, v1, v2, v3;
+	int parsed;
+
+	if ( !text || !outValue ) {
+		return qfalse;
+	}
+
+	parsed = sscanf( text, "%f %f %f %f", &v0, &v1, &v2, &v3 );
+	if ( parsed <= 0 ) {
+		return qfalse;
+	}
+
+	if ( parsed == 4 ) {
+		*outValue = v3;
+		return qtrue;
+	}
+
+	*outValue = v0;
+	return qtrue;
+}
+
+static qboolean vk_rt_world_has_sky_surface( void )
+{
+	int i;
+
+	if ( !tr.world || !tr.world->surfaces || tr.world->numsurfaces <= 0 ) {
+		return qfalse;
+	}
+
+	for ( i = 0; i < tr.world->numsurfaces; i++ ) {
+		const msurface_t *surf = &tr.world->surfaces[i];
+		if ( surf->shader && surf->shader->isSky ) {
+			return qtrue;
+		}
+	}
+
+	return qfalse;
+}
+
+static void vk_rt_estimate_world_bounds( vec3_t center, float *radius )
+{
+	vec3_t mins = { -2048.0f, -2048.0f, -2048.0f };
+	vec3_t maxs = { 2048.0f, 2048.0f, 2048.0f };
+	vec3_t extents;
+
+	if ( tr.world && tr.world->bmodels ) {
+		VectorCopy( tr.world->bmodels[0].bounds[0], mins );
+		VectorCopy( tr.world->bmodels[0].bounds[1], maxs );
+	}
+
+	VectorAdd( mins, maxs, center );
+	VectorScale( center, 0.5f, center );
+	VectorSubtract( maxs, mins, extents );
+
+	if ( radius ) {
+		*radius = MAX( 1024.0f, 0.5f * VectorLength( extents ) );
+	}
+}
+
+static void vk_rt_resolve_sun_params( vec3_t outDirection, vec3_t outColor, qboolean *outFallbackFromSky )
+{
+	float sunLen;
+	const float minElevation = 0.25f;
+
+	if ( outFallbackFromSky ) {
+		*outFallbackFromSky = qfalse;
+	}
+
+	VectorCopy( tr.sunDirection, outDirection );
+	sunLen = VectorNormalize( outDirection );
+	if ( sunLen <= 0.0f ) {
+		// Match renderer default sky sun heading when map scripts do not provide q3map_sun.
+		VectorSet( outDirection, 0.45f, 0.30f, 0.90f );
+		VectorNormalize( outDirection );
+	}
+	// Keep fallback sun in a sensible upper-hemisphere band to avoid near-horizon/underground angles.
+	if ( outDirection[2] < minElevation ) {
+		const float targetXYLen = sqrtf( MAX( 0.0f, 1.0f - minElevation * minElevation ) );
+		const float currentXYLen = sqrtf( outDirection[0] * outDirection[0] + outDirection[1] * outDirection[1] );
+		if ( currentXYLen > 1e-5f ) {
+			const float scale = targetXYLen / currentXYLen;
+			outDirection[0] *= scale;
+			outDirection[1] *= scale;
+		} else {
+			outDirection[0] = 0.8321f;
+			outDirection[1] = 0.4962f;
+		}
+		outDirection[2] = minElevation;
+		VectorNormalize( outDirection );
+	}
+
+	if ( VectorLengthSquared( tr.sunLight ) > 1e-8f ) {
+		VectorCopy( tr.sunLight, outColor );
+		return;
+	}
+
+	vk_rt_rebuild_world_light_cache();
+
+	if ( s_vkRtWorldLightCache.hasSkySurface ) {
+		float ambientScale = Com_Clamp( 0.75f, 3.0f, 1.20f + s_vkRtWorldLightCache.worldspawnAmbient * ( 1.0f / 56.0f ) );
+		VectorScale( s_vkRtWorldLightCache.worldspawnColor, ambientScale, outColor );
+		if ( outFallbackFromSky ) {
+			*outFallbackFromSky = qtrue;
+		}
+		return;
+	}
+
+	VectorSet( outColor, 0.18f, 0.20f, 0.24f );
+}
+
+static void vk_rt_reset_world_light_cache( void )
+{
+	Com_Memset( &s_vkRtWorldLightCache, 0, sizeof( s_vkRtWorldLightCache ) );
+	VectorSet( s_vkRtWorldLightCache.worldspawnColor, 1.0f, 1.0f, 1.0f );
+	s_vkRtWorldLightCache.worldspawnAmbient = 5.0f;
+}
+
+static void vk_rt_rebuild_world_light_cache( void )
+{
+	const char *parse;
+	const char *token;
+	char keyName[MAX_TOKEN_CHARS];
+	char value[MAX_TOKEN_CHARS];
+	uint32_t truncated = 0;
+
+	if ( s_vkRtWorldLightCache.world == tr.world ) {
+		return;
+	}
+
+	vk_rt_reset_world_light_cache();
+	s_vkRtWorldLightCache.world = tr.world;
+
+	if ( !tr.world || !tr.world->entityString || !tr.world->entityString[0] ) {
+		return;
+	}
+
+	parse = tr.world->entityString;
+
+	while ( 1 ) {
+		char className[MAX_QPATH] = { 0 };
+		qboolean isLight = qfalse;
+		qboolean isWorldspawn = qfalse;
+		qboolean hasOrigin = qfalse;
+		qboolean hasColor = qfalse;
+		qboolean hasWorldColor = qfalse;
+		qboolean hasWorldAmbient = qfalse;
+		vec3_t origin = { 0.0f, 0.0f, 0.0f };
+		vec3_t color = { 1.0f, 1.0f, 1.0f };
+		vec3_t worldColor = { 1.0f, 1.0f, 1.0f };
+		float worldAmbient = 5.0f;
+		float lightValue = 300.0f;
+		float radiusValue = 0.0f;
+		float scaleValue = 1.0f;
+		float maxColor;
+		rtxRtGpuLight_t *dst;
+
+		token = COM_ParseExt( &parse, qtrue );
+		if ( !token[0] ) {
+			break;
+		}
+		if ( token[0] != '{' ) {
+			continue;
+		}
+
+		while ( 1 ) {
+			token = COM_ParseExt( &parse, qtrue );
+			if ( !token[0] ) {
+				break;
+			}
+			if ( token[0] == '}' ) {
+				break;
+			}
+
+			Q_strncpyz( keyName, token, sizeof( keyName ) );
+
+			token = COM_ParseExt( &parse, qfalse );
+			if ( !token[0] ) {
+				break;
+			}
+
+			Q_strncpyz( value, token, sizeof( value ) );
+
+			if ( !Q_stricmp( keyName, "classname" ) ) {
+				Q_strncpyz( className, value, sizeof( className ) );
+				if ( !Q_stricmp( value, "light" ) || !Q_stricmp( value, "lightJunior" ) ) {
+					isLight = qtrue;
+				}
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "origin" ) ) {
+				if ( vk_rt_parse_entity_vec3( value, origin ) ) {
+					hasOrigin = qtrue;
+				}
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "ambient" ) ) {
+				worldAmbient = Q_atof( value );
+				hasWorldAmbient = qtrue;
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "_color" ) || !Q_stricmp( keyName, "color" ) ) {
+				vec3_t parsedColor;
+				if ( vk_rt_parse_entity_vec3( value, parsedColor ) ) {
+					VectorCopy( parsedColor, color );
+					hasColor = qtrue;
+					if ( !Q_stricmp( keyName, "_color" ) ) {
+						VectorCopy( parsedColor, worldColor );
+						hasWorldColor = qtrue;
+					}
+				}
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "light" ) || !Q_stricmp( keyName, "_light" ) ) {
+				float parsedLight;
+				if ( vk_rt_parse_entity_light_value( value, &parsedLight ) ) {
+					lightValue = parsedLight;
+				}
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "radius" ) || !Q_stricmp( keyName, "_radius" ) ) {
+				radiusValue = Q_atof( value );
+				continue;
+			}
+
+			if ( !Q_stricmp( keyName, "scale" ) ) {
+				scaleValue = Q_atof( value );
+				continue;
+			}
+		}
+
+		isWorldspawn = !Q_stricmp( className, "worldspawn" ) ? qtrue : qfalse;
+		if ( isWorldspawn ) {
+			float maxColor = MAX( worldColor[0], MAX( worldColor[1], worldColor[2] ) );
+			if ( hasWorldColor && maxColor > 1.0f ) {
+				VectorScale( worldColor, 1.0f / 255.0f, worldColor );
+			}
+			if ( hasWorldColor ) {
+				s_vkRtWorldLightCache.worldspawnColor[0] = MAX( 0.0f, worldColor[0] );
+				s_vkRtWorldLightCache.worldspawnColor[1] = MAX( 0.0f, worldColor[1] );
+				s_vkRtWorldLightCache.worldspawnColor[2] = MAX( 0.0f, worldColor[2] );
+			}
+			if ( hasWorldAmbient ) {
+				s_vkRtWorldLightCache.worldspawnAmbient = MAX( 0.0f, worldAmbient );
+			}
+		}
+
+		if ( !isLight || !hasOrigin ) {
+			continue;
+		}
+
+		if ( s_vkRtWorldLightCache.count >= RTX_RT_MAX_WORLD_ENTITY_LIGHTS ) {
+			truncated++;
+			continue;
+		}
+
+	if ( !hasColor ) {
+		VectorSet( color, 1.0f, 1.0f, 1.0f );
+	}
+		maxColor = MAX( color[0], MAX( color[1], color[2] ) );
+		if ( maxColor > 1.0f ) {
+			VectorScale( color, 1.0f / 255.0f, color );
+		}
+		color[0] = MAX( 0.0f, color[0] );
+		color[1] = MAX( 0.0f, color[1] );
+		color[2] = MAX( 0.0f, color[2] );
+
+	lightValue = MAX( 1.0f, lightValue );
+	scaleValue = MAX( 0.01f, scaleValue );
+
+		if ( radiusValue <= 0.0f ) {
+			radiusValue = MAX( 96.0f, lightValue * 1.5f );
+		}
+		radiusValue = Com_Clamp( 32.0f, 4096.0f, radiusValue );
+
+		dst = &s_vkRtWorldLightCache.lights[ s_vkRtWorldLightCache.count++ ];
+		dst->positionRadius[0] = origin[0];
+		dst->positionRadius[1] = origin[1];
+		dst->positionRadius[2] = origin[2];
+		dst->positionRadius[3] = radiusValue;
+	dst->colorType[0] = color[0] * ( lightValue / 300.0f ) * scaleValue * vk_rt_world_light_scale();
+	dst->colorType[1] = color[1] * ( lightValue / 300.0f ) * scaleValue * vk_rt_world_light_scale();
+	dst->colorType[2] = color[2] * ( lightValue / 300.0f ) * scaleValue * vk_rt_world_light_scale();
+	dst->colorType[3] = 0.0f;
+		dst->directionSoftness[0] = 0.0f;
+		dst->directionSoftness[1] = 0.0f;
+		dst->directionSoftness[2] = 0.0f;
+		dst->directionSoftness[3] = vk_rt_shadow_softness();
+	}
+
+	s_vkRtWorldLightCache.hasSkySurface = vk_rt_world_has_sky_surface();
+
+	if ( s_vkRtWorldLightCache.count == 0 && !s_vkRtWorldLightCache.warnedEmpty ) {
+		ri.Printf( PRINT_WARNING,
+			"RTX RT: no map light entities detected in '%s'; direct RT lighting relies on sun and dynamic lights only.\n",
+			tr.world ? tr.world->baseName : "unknown" );
+		s_vkRtWorldLightCache.warnedEmpty = qtrue;
+	} else if ( s_vkRtWorldLightCache.count > 0 ) {
+		ri.Printf( PRINT_ALL,
+			"RTX RT: world entity lights active: %u%s\n",
+			s_vkRtWorldLightCache.count,
+			truncated ? va( " (%u truncated)", truncated ) : "" );
+	}
+}
+
+static uint32_t vk_rt_append_world_entity_lights( rtxRtGpuLight_t *lights, uint32_t count, uint32_t maxLights )
+{
+	const uint32_t available = ( maxLights > count ) ? ( maxLights - count ) : 0u;
+	uint32_t remaining;
+	uint32_t i;
+	float shadowSoftness;
+
+	if ( !lights || available == 0 ) {
+		return count;
+	}
+
+	vk_rt_rebuild_world_light_cache();
+	if ( s_vkRtWorldLightCache.count == 0 ) {
+		return count;
+	}
+
+	shadowSoftness = vk_rt_shadow_softness();
+	remaining = available;
+
+	if ( s_vkRtWorldLightCache.count <= remaining ) {
+		for ( i = 0; i < s_vkRtWorldLightCache.count && count < maxLights; i++ ) {
+			lights[count] = s_vkRtWorldLightCache.lights[i];
+			lights[count].directionSoftness[3] = shadowSoftness;
+			count++;
+		}
+		return count;
+	}
+
+	{
+		qboolean selected[RTX_RT_MAX_WORLD_ENTITY_LIGHTS];
+		uint32_t selectCount = 0;
+
+		Com_Memset( selected, 0, sizeof( selected ) );
+
+		while ( selectCount < remaining && count < maxLights ) {
+			uint32_t bestIndex = ~0u;
+			float bestDistSq = 1.0e30f;
+
+			for ( i = 0; i < s_vkRtWorldLightCache.count; i++ ) {
+				const rtxRtGpuLight_t *candidate = &s_vkRtWorldLightCache.lights[i];
+				float dx;
+				float dy;
+				float dz;
+				float distSq;
+
+				if ( selected[i] ) {
+					continue;
+				}
+
+				dx = candidate->positionRadius[0] - backEnd.refdef.vieworg[0];
+				dy = candidate->positionRadius[1] - backEnd.refdef.vieworg[1];
+				dz = candidate->positionRadius[2] - backEnd.refdef.vieworg[2];
+				distSq = dx * dx + dy * dy + dz * dz;
+
+				if ( distSq < bestDistSq ) {
+					bestDistSq = distSq;
+					bestIndex = i;
+				}
+			}
+
+			if ( bestIndex == ~0u ) {
+				break;
+			}
+
+			selected[bestIndex] = qtrue;
+			lights[count] = s_vkRtWorldLightCache.lights[bestIndex];
+			lights[count].directionSoftness[3] = shadowSoftness;
+			count++;
+			selectCount++;
+		}
+	}
+
+	return count;
+}
+
 static qboolean vk_rt_update_light_buffer( void )
 {
 	rtxRtGpuLight_t *lights = NULL;
@@ -1150,24 +2327,35 @@ static qboolean vk_rt_update_light_buffer( void )
 	float dlightScale = r_dlightScale ? r_dlightScale->value : 1.0f;
 	float dlightIntensity = r_dlightIntensity ? r_dlightIntensity->value : 1.0f;
 	vec3_t sunDir;
-	float sunLen;
+	vec3_t sunColor;
+	vec3_t sunOrigin;
+	float sunRadius;
+	qboolean fallbackSunFromSky = qfalse;
 	int i;
 
 	lights = (rtxRtGpuLight_t *)ri.Malloc( maxLights * sizeof( rtxRtGpuLight_t ) );
 	Com_Memset( lights, 0, maxLights * sizeof( rtxRtGpuLight_t ) );
 
-	VectorCopy( tr.sunDirection, sunDir );
-	sunLen = VectorNormalize( sunDir );
-	if ( sunLen > 0.0f && VectorLengthSquared( tr.sunLight ) > 1e-8f && count < maxLights ) {
+	vk_rt_resolve_sun_params( sunDir, sunColor, &fallbackSunFromSky );
+	if ( VectorLengthSquared( sunColor ) > 1e-8f && count < maxLights ) {
 		rtxRtGpuLight_t *sun = &lights[count++];
-		sun->colorType[0] = tr.sunLight[0] * vk_rt_sun_intensity();
-		sun->colorType[1] = tr.sunLight[1] * vk_rt_sun_intensity();
-		sun->colorType[2] = tr.sunLight[2] * vk_rt_sun_intensity();
+		sun->colorType[0] = sunColor[0] * vk_rt_sun_intensity();
+		sun->colorType[1] = sunColor[1] * vk_rt_sun_intensity();
+		sun->colorType[2] = sunColor[2] * vk_rt_sun_intensity();
 		sun->colorType[3] = 1.0f;
 		sun->directionSoftness[0] = sunDir[0];
 		sun->directionSoftness[1] = sunDir[1];
 		sun->directionSoftness[2] = sunDir[2];
 		sun->directionSoftness[3] = vk_rt_shadow_softness();
+
+		if ( fallbackSunFromSky ) {
+			vk_rt_estimate_world_bounds( sunOrigin, &sunRadius );
+			VectorMA( sunOrigin, sunRadius * 2.5f + 2048.0f, sunDir, sunOrigin );
+			sun->positionRadius[0] = sunOrigin[0];
+			sun->positionRadius[1] = sunOrigin[1];
+			sun->positionRadius[2] = sunOrigin[2];
+			sun->positionRadius[3] = sunRadius * 6.0f;
+		}
 	}
 
 	for ( i = 0; i < backEnd.refdef.num_dlights && count < maxLights; i++ ) {
@@ -1194,21 +2382,20 @@ static qboolean vk_rt_update_light_buffer( void )
 		dst->directionSoftness[3] = vk_rt_shadow_softness();
 	}
 
+	count = vk_rt_append_world_entity_lights( lights, count, maxLights );
+
 	uploadCount = MAX( count, 1u );
 	uploadBytes = (size_t)uploadCount * sizeof( rtxRtGpuLight_t );
 
-	if ( vk.rt.light_buffer.buffer == VK_NULL_HANDLE || vk.rt.light_buffer.size < uploadBytes ) {
-		vk_rt_destroy_buffer( &vk.rt.light_buffer );
-		if ( !vk_rt_create_buffer(
-			(VkDeviceSize)uploadBytes,
-			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			qfalse,
-			"rt lights",
-			&vk.rt.light_buffer ) ) {
-			ri.Free( lights );
-			return qfalse;
-		}
+	if ( !vk_rt_ensure_buffer_capacity(
+		&vk.rt.light_buffer,
+		(VkDeviceSize)uploadBytes,
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		qfalse,
+		"rt lights" ) ) {
+		ri.Free( lights );
+		return qfalse;
 	}
 
 	if ( count == 0 ) {
@@ -1302,6 +2489,11 @@ static qboolean vk_rt_ensure_scratch_buffer( VkDeviceSize minSize )
 		return qfalse;
 	}
 
+	if ( vk.rt.scratch_buffer.buffer != VK_NULL_HANDLE ) {
+		if ( !vk_rt_wait_for_inflight_frames( "scratch buffer resize" ) ) {
+			return qfalse;
+		}
+	}
 	vk_rt_destroy_buffer( &vk.rt.scratch_buffer );
 
 	if ( !vk_rt_create_buffer(
@@ -1660,6 +2852,23 @@ static rtxRtColorSpace_t vk_rt_material_data_color_space( const image_t *image )
 	return RTX_RT_COLORSPACE_LINEAR;
 }
 
+static int32_t vk_rt_image_to_scene_texture_index( const image_t *image )
+{
+	int i;
+
+	if ( !image ) {
+		return -1;
+	}
+
+	for ( i = 0; i < tr.numImages; i++ ) {
+		if ( tr.images[i] == image ) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
 static void vk_rt_apply_material_overrides( rtxRtMaterial_t *material )
 {
 	if ( !material ) {
@@ -1716,6 +2925,7 @@ static void vk_rt_translate_shader_to_material( const shader_t *shader, rtxRtMat
 {
 	int i;
 	image_t *albedoImage = NULL;
+	image_t *fallbackImage = NULL;
 	float emissiveKeywordBoost = 1.0f;
 
 	Com_Memset( material, 0, sizeof( *material ) );
@@ -1734,6 +2944,7 @@ static void vk_rt_translate_shader_to_material( const shader_t *shader, rtxRtMat
 	material->albedoColorSpace = RTX_RT_COLORSPACE_SRGB;
 	material->normalColorSpace = RTX_RT_COLORSPACE_LINEAR;
 	material->emissiveColorSpace = RTX_RT_COLORSPACE_SRGB;
+	material->albedoTextureIndex = -1;
 
 	if ( rtx_rt_emissive_keyword_boost ) {
 		emissiveKeywordBoost = MAX( 0.0f, rtx_rt_emissive_keyword_boost->value );
@@ -1814,7 +3025,10 @@ static void vk_rt_translate_shader_to_material( const shader_t *shader, rtxRtMat
 		image = bundle->image[0];
 		material->sourceStageCount++;
 
-		if ( !albedoImage && image ) {
+		if ( !fallbackImage && image ) {
+			fallbackImage = (image_t *)image;
+		}
+		if ( !albedoImage && image && !( image->flags & IMGFLAG_LIGHTMAP ) ) {
 			albedoImage = (image_t *)image;
 		}
 
@@ -1890,12 +3104,18 @@ static void vk_rt_translate_shader_to_material( const shader_t *shader, rtxRtMat
 		material->roughness = MAX( material->roughness, 0.7f );
 	}
 
+	if ( !albedoImage ) {
+		albedoImage = fallbackImage;
+	}
+
 	if ( albedoImage ) {
 		material->albedoColorSpace = vk_rt_material_albedo_color_space( albedoImage );
 		material->emissiveColorSpace = vk_rt_material_albedo_color_space( albedoImage );
+		material->albedoTextureIndex = vk_rt_image_to_scene_texture_index( albedoImage );
 	} else {
 		material->albedoColorSpace = RTX_RT_COLORSPACE_SRGB;
 		material->emissiveColorSpace = RTX_RT_COLORSPACE_SRGB;
+		material->albedoTextureIndex = -1;
 	}
 
 	if ( material->flags & RTX_RT_MATFLAG_MASKED ) {
@@ -2346,6 +3566,7 @@ static qboolean vk_rt_extract_world_geometry( rtxRtCpuGeometry_t *geometry )
 	uint32_t faceCount = 0;
 	uint32_t gridCount = 0;
 	uint32_t triCount = 0;
+	uint32_t skySkipCount = 0;
 	uint32_t referenceTriangleCount = 0;
 	uint32_t shaderFallbacks = 0;
 
@@ -2361,6 +3582,10 @@ static qboolean vk_rt_extract_world_geometry( rtxRtCpuGeometry_t *geometry )
 
 		if ( !surface->shader ) {
 			shaderFallbacks++;
+		}
+		if ( shader && ( shader->isSky || ( shader->surfaceFlags & SURF_SKY ) ) ) {
+			skySkipCount++;
+			continue;
 		}
 
 		switch ( *surface->data ) {
@@ -2432,15 +3657,28 @@ static qboolean vk_rt_extract_world_geometry( rtxRtCpuGeometry_t *geometry )
 			geometry->maskedTriangleCount,
 			geometry->degenerateTriangleCount,
 			shaderFallbacks );
+		if ( skySkipCount > 0 ) {
+			ri.Printf( PRINT_DEVELOPER, "RTX RT: skipped %u sky surfaces from RT BLAS (sky handled via miss/environment)\n", skySkipCount );
+		}
 	}
 
 	if ( rtx_rt_material_debug && rtx_rt_material_debug->integer >= 2 ) {
 		uint32_t maxPrint = MIN( geometry->numMaterials, 24u );
+		uint32_t texturedCount = 0u;
 		uint32_t m;
+		for ( m = 0; m < geometry->numMaterials; m++ ) {
+			if ( geometry->materials[m].albedoTextureIndex >= 0 ) {
+				texturedCount++;
+			}
+		}
+		ri.Printf( PRINT_DEVELOPER,
+			"RTX RT: world materials with albedo textures: %u / %u\n",
+			texturedCount,
+			geometry->numMaterials );
 		for ( m = 0; m < maxPrint; m++ ) {
 			const rtxRtMaterial_t *mat = &geometry->materials[m];
 			ri.Printf( PRINT_DEVELOPER,
-				"RTX RT material[%u] '%s': flags=0x%x base=(%.2f %.2f %.2f) rm=(%.2f %.2f) emissiveScale=%.2f alphaCutoff=%.2f cs=(%u %u %u)\n",
+				"RTX RT material[%u] '%s': flags=0x%x base=(%.2f %.2f %.2f) rm=(%.2f %.2f) emissiveScale=%.2f alphaCutoff=%.2f cs=(%u %u %u) tex=%d\n",
 				m,
 				mat->name,
 				mat->flags,
@@ -2450,7 +3688,8 @@ static qboolean vk_rt_extract_world_geometry( rtxRtCpuGeometry_t *geometry )
 				mat->alphaCutoff,
 				mat->albedoColorSpace,
 				mat->normalColorSpace,
-				mat->emissiveColorSpace );
+				mat->emissiveColorSpace,
+				mat->albedoTextureIndex );
 		}
 	}
 
@@ -2521,6 +3760,11 @@ static qboolean vk_rt_build_triangles_blas( rtxVkRtAccelerationStructure_t *outA
 			&buildSizes );
 	}
 
+	if ( outAs->valid ) {
+		if ( !vk_rt_wait_for_inflight_frames( debugName ? debugName : "BLAS rebuild" ) ) {
+			return qfalse;
+		}
+	}
 	vk_rt_destroy_as( outAs );
 	if ( !vk_rt_create_as( VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, buildSizes.accelerationStructureSize, debugName, outAs ) ) {
 		return qfalse;
@@ -3741,6 +4985,9 @@ static qboolean vk_rt_extract_dynamic_geometry( rtxRtCpuGeometry_t *geometry )
 			if ( ent->e.reType != RT_MODEL ) {
 				continue;
 			}
+			if ( !vk_rt_entity_visible_in_current_view( ent ) ) {
+				continue;
+			}
 
 			isFirstPerson = ( ent->e.renderfx & RF_FIRST_PERSON ) ? qtrue : qfalse;
 			if ( prioritizeFirstPerson ) {
@@ -3766,6 +5013,10 @@ static qboolean vk_rt_extract_dynamic_geometry( rtxRtCpuGeometry_t *geometry )
 	if ( effectMode > 0 ) {
 		for ( i = 0; i < backEnd.refdef.num_entities; i++ ) {
 			const trRefEntity_t *ent = &backEnd.refdef.entities[i];
+
+			if ( !vk_rt_entity_visible_in_current_view( ent ) ) {
+				continue;
+			}
 
 			switch ( ent->e.reType ) {
 			case RT_SPRITE:
@@ -3865,6 +5116,15 @@ static qboolean vk_rt_build_dynamic_scene_blas( VkDeviceSize *frameBudgetBytesUs
 	}
 
 	if ( geometry.numVertices < 3 || geometry.numIndices < 3 ) {
+		if ( vk.rt.dynamic_blas.valid ||
+			vk.rt.dynamic_vertex_buffer.buffer != VK_NULL_HANDLE ||
+			vk.rt.dynamic_index_buffer.buffer != VK_NULL_HANDLE ||
+			vk.rt.dynamic_material_buffer.buffer != VK_NULL_HANDLE ) {
+			if ( !vk_rt_wait_for_inflight_frames( "dynamic geometry cleanup" ) ) {
+				vk_rt_cpu_geometry_free( &geometry );
+				return qfalse;
+			}
+		}
 		vk_rt_destroy_as( &vk.rt.dynamic_blas );
 		vk_rt_destroy_buffer( &vk.rt.dynamic_vertex_buffer );
 		vk_rt_destroy_buffer( &vk.rt.dynamic_index_buffer );
@@ -3875,6 +5135,7 @@ static qboolean vk_rt_build_dynamic_scene_blas( VkDeviceSize *frameBudgetBytesUs
 		vk.rt.dynamic_entity_count = geometry.sourceEntityCount;
 		vk.rt.dynamic_effect_count = geometry.sourceEffectCount;
 		vk.rt.stats.dynamic_triangles = 0;
+		vk.rt.needsRebuild = qtrue;
 		vk_rt_cpu_geometry_free( &geometry );
 		return qtrue;
 	}
@@ -3890,27 +5151,24 @@ static qboolean vk_rt_build_dynamic_scene_blas( VkDeviceSize *frameBudgetBytesUs
 		return qfalse;
 	}
 
-	vk_rt_destroy_buffer( &vk.rt.dynamic_vertex_buffer );
-	vk_rt_destroy_buffer( &vk.rt.dynamic_index_buffer );
-
-	if ( !vk_rt_create_buffer(
+	if ( !vk_rt_ensure_buffer_capacity(
+		&vk.rt.dynamic_vertex_buffer,
 		geometry.numVertices * sizeof( rtxRtPackedVertex_t ),
 		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
 			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		qtrue,
-		"rt dynamic vertices",
-		&vk.rt.dynamic_vertex_buffer ) ||
-		!vk_rt_create_buffer(
+		"rt dynamic vertices" ) ||
+		!vk_rt_ensure_buffer_capacity(
+			&vk.rt.dynamic_index_buffer,
 			geometry.numIndices * sizeof( uint32_t ),
 			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 				VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
 				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			qtrue,
-			"rt dynamic indices",
-			&vk.rt.dynamic_index_buffer ) ) {
+			"rt dynamic indices" ) ) {
 		vk_rt_cpu_geometry_free( &geometry );
 		return qfalse;
 	}
@@ -3958,6 +5216,7 @@ static qboolean vk_rt_build_dynamic_scene_blas( VkDeviceSize *frameBudgetBytesUs
 	}
 
 	vk.rt.stats.dynamic_build_bytes += (uint64_t)( vk.rt.dynamic_blas.size + vk.rt.scratch_buffer.size );
+	vk.rt.needsRebuild = qtrue;
 
 	if ( vk_rt_debug_as_stats_level() >= 1 ) {
 		ri.Printf( PRINT_DEVELOPER,
@@ -3995,19 +5254,27 @@ static qboolean vk_rt_build_dynamic_scene_blas( VkDeviceSize *frameBudgetBytesUs
 
 static qboolean vk_rt_ensure_descriptor_resources( void )
 {
-	VkDescriptorPoolSize poolSizes[3];
+	VkDescriptorPoolSize poolSizes[4];
 	VkDescriptorPoolCreateInfo poolInfo;
-	VkDescriptorSetLayoutBinding bindings[12];
+	VkDescriptorSetLayoutBinding bindings[14];
 	VkDescriptorSetLayoutCreateInfo layoutInfo;
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
 	VkDescriptorSetAllocateInfo allocInfo;
+	VkDescriptorSetLayout descriptorLayouts[ NUM_COMMAND_BUFFERS ];
+	uint32_t i;
 	VkResult result;
 
 	if ( vk.rt.descriptor_set_layout != VK_NULL_HANDLE &&
 		vk.rt.descriptor_pool != VK_NULL_HANDLE &&
-		vk.rt.pipeline_layout != VK_NULL_HANDLE &&
-		vk.rt.descriptor_set != VK_NULL_HANDLE ) {
-		return qtrue;
+		vk.rt.pipeline_layout != VK_NULL_HANDLE ) {
+		for ( i = 0; i < NUM_COMMAND_BUFFERS; i++ ) {
+			if ( vk.rt.descriptor_set[i] == VK_NULL_HANDLE ) {
+				break;
+			}
+		}
+		if ( i == NUM_COMMAND_BUFFERS ) {
+			return qtrue;
+		}
 	}
 
 	if ( vk.rt.descriptor_set_layout != VK_NULL_HANDLE ) {
@@ -4022,18 +5289,20 @@ static qboolean vk_rt_ensure_descriptor_resources( void )
 		qvkDestroyPipelineLayout( vk.device, vk.rt.pipeline_layout, NULL );
 		vk.rt.pipeline_layout = VK_NULL_HANDLE;
 	}
-	vk.rt.descriptor_set = VK_NULL_HANDLE;
+	Com_Memset( vk.rt.descriptor_set, 0, sizeof( vk.rt.descriptor_set ) );
 
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-	poolSizes[0].descriptorCount = 1;
+	poolSizes[0].descriptorCount = NUM_COMMAND_BUFFERS;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSizes[1].descriptorCount = 3;
+	poolSizes[1].descriptorCount = NUM_COMMAND_BUFFERS * 3;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[2].descriptorCount = 8;
+	poolSizes[2].descriptorCount = NUM_COMMAND_BUFFERS * 8;
+	poolSizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSizes[3].descriptorCount = NUM_COMMAND_BUFFERS * ( 1 + RTX_RT_MAX_SCENE_TEXTURES );
 
 	Com_Memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
+	poolInfo.maxSets = NUM_COMMAND_BUFFERS;
 	poolInfo.poolSizeCount = ARRAY_LEN( poolSizes );
 	poolInfo.pPoolSizes = poolSizes;
 	result = qvkCreateDescriptorPool( vk.device, &poolInfo, NULL, &vk.rt.descriptor_pool );
@@ -4091,6 +5360,14 @@ static qboolean vk_rt_ensure_descriptor_resources( void )
 	bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	bindings[11].descriptorCount = 1;
 	bindings[11].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+	bindings[12].binding = RTX_RT_DESC_BINDING_SCENE_COLOR;
+	bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[12].descriptorCount = 1;
+	bindings[12].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+	bindings[13].binding = RTX_RT_DESC_BINDING_SCENE_TEXTURES;
+	bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[13].descriptorCount = RTX_RT_MAX_SCENE_TEXTURES;
+	bindings[13].stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
 	Com_Memset( &layoutInfo, 0, sizeof( layoutInfo ) );
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -4124,11 +5401,14 @@ static qboolean vk_rt_ensure_descriptor_resources( void )
 	Com_Memset( &allocInfo, 0, sizeof( allocInfo ) );
 	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	allocInfo.descriptorPool = vk.rt.descriptor_pool;
-	allocInfo.descriptorSetCount = 1;
-	allocInfo.pSetLayouts = &vk.rt.descriptor_set_layout;
-	result = qvkAllocateDescriptorSets( vk.device, &allocInfo, &vk.rt.descriptor_set );
+	allocInfo.descriptorSetCount = NUM_COMMAND_BUFFERS;
+	for ( i = 0; i < NUM_COMMAND_BUFFERS; i++ ) {
+		descriptorLayouts[i] = vk.rt.descriptor_set_layout;
+	}
+	allocInfo.pSetLayouts = descriptorLayouts;
+	result = qvkAllocateDescriptorSets( vk.device, &allocInfo, vk.rt.descriptor_set );
 	if ( result != VK_SUCCESS ) {
-		ri.Printf( PRINT_ERROR, "RTX RT: failed to allocate descriptor set: %s\n", vk_result_string( result ) );
+		ri.Printf( PRINT_ERROR, "RTX RT: failed to allocate RT descriptor sets: %s\n", vk_result_string( result ) );
 		return qfalse;
 	}
 
@@ -4200,9 +5480,29 @@ static qboolean vk_rt_ensure_output_image( void )
 		VK_IMAGE_USAGE_STORAGE_BIT
 	};
 	VkResult result;
-	uint32_t width = (uint32_t)MAX( 1, glConfig.vidWidth );
-	uint32_t height = (uint32_t)MAX( 1, glConfig.vidHeight );
+	float resolutionScale = vk.rt.dynamic_resolution_scale;
+	uint32_t baseWidth = (uint32_t)MAX( 1, glConfig.vidWidth );
+	uint32_t baseHeight = (uint32_t)MAX( 1, glConfig.vidHeight );
+	uint32_t width;
+	uint32_t height;
 	int i;
+
+	if ( vk_rt_dynamic_resolution_enabled() ) {
+		float minScale = vk_rt_dynamic_resolution_min_scale();
+		float maxScale = vk_rt_dynamic_resolution_max_scale();
+		if ( minScale > maxScale ) {
+			float tmp = minScale;
+			minScale = maxScale;
+			maxScale = tmp;
+		}
+		resolutionScale = Com_Clamp( minScale, maxScale, resolutionScale );
+	} else {
+		resolutionScale = 1.0f;
+	}
+
+	width = (uint32_t)MAX( 1, (int)floorf( (float)baseWidth * resolutionScale + 0.5f ) );
+	height = (uint32_t)MAX( 1, (int)floorf( (float)baseHeight * resolutionScale + 0.5f ) );
+	vk.rt.dynamic_resolution_scale = MIN( (float)width / (float)baseWidth, (float)height / (float)baseHeight );
 
 	if ( vk.rt.output_image != VK_NULL_HANDLE &&
 		vk.rt.history_image[0] != VK_NULL_HANDLE &&
@@ -4511,22 +5811,31 @@ static qboolean vk_rt_ensure_pipeline( void )
 static qboolean vk_rt_update_descriptor_set( void )
 {
 	VkWriteDescriptorSetAccelerationStructureKHR asInfo;
-	VkDescriptorImageInfo imageInfos[3];
+	VkDescriptorImageInfo imageInfos[4 + RTX_RT_MAX_SCENE_TEXTURES];
 	VkDescriptorBufferInfo bufferInfos[8];
-	VkWriteDescriptorSet writes[12];
+	VkWriteDescriptorSet writes[14];
+	VkDescriptorSet descriptorSet;
+	Vk_Sampler_Def sceneSamplerDef;
+	const image_t *sceneImage;
 	const rtxVkRtBuffer_t *dynamicVertices;
 	const rtxVkRtBuffer_t *dynamicIndices;
 	const rtxVkRtBuffer_t *dynamicMaterials;
+	uint32_t i;
 	uint32_t historyReadIndex = vk.rt.history_read_index & 1u;
 	uint32_t historyWriteIndex = historyReadIndex ^ 1u;
+	uint32_t descriptorIndex = (uint32_t)( vk.cmd_index % NUM_COMMAND_BUFFERS );
 
-	if ( vk.rt.descriptor_set == VK_NULL_HANDLE || !vk.rt.tlas.valid || vk.rt.output_view == VK_NULL_HANDLE ) {
+	descriptorSet = vk.rt.descriptor_set[descriptorIndex];
+	if ( descriptorSet == VK_NULL_HANDLE || !vk.rt.tlas.valid || vk.rt.output_view == VK_NULL_HANDLE ) {
 		return qfalse;
 	}
 	if ( vk.rt.history_view[historyReadIndex] == VK_NULL_HANDLE || vk.rt.history_view[historyWriteIndex] == VK_NULL_HANDLE ) {
 		return qfalse;
 	}
 	if ( vk.rt.temporal_params_buffer.buffer == VK_NULL_HANDLE ) {
+		return qfalse;
+	}
+	if ( vk.color_image_view == VK_NULL_HANDLE ) {
 		return qfalse;
 	}
 
@@ -4559,6 +5868,41 @@ static qboolean vk_rt_update_descriptor_set( void )
 	imageInfos[2].sampler = VK_NULL_HANDLE;
 	imageInfos[2].imageView = vk.rt.history_view[historyWriteIndex];
 	imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	Com_Memset( &sceneSamplerDef, 0, sizeof( sceneSamplerDef ) );
+	sceneSamplerDef.gl_mag_filter = GL_LINEAR;
+	sceneSamplerDef.gl_min_filter = GL_LINEAR;
+	sceneSamplerDef.address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sceneSamplerDef.max_lod_1_0 = qtrue;
+	sceneSamplerDef.noAnisotropy = qtrue;
+	imageInfos[3].sampler = vk_find_sampler( &sceneSamplerDef );
+	imageInfos[3].imageView = vk.color_image_view;
+	imageInfos[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	for ( i = 0; i < RTX_RT_MAX_SCENE_TEXTURES; i++ ) {
+		sceneImage = ( i < (uint32_t)tr.numImages ) ? tr.images[i] : NULL;
+		if ( !sceneImage || sceneImage->view == VK_NULL_HANDLE ) {
+			sceneImage = tr.whiteImage;
+		}
+		if ( !sceneImage || sceneImage->view == VK_NULL_HANDLE ) {
+			imageInfos[4 + i].sampler = imageInfos[3].sampler;
+			imageInfos[4 + i].imageView = imageInfos[3].imageView;
+			imageInfos[4 + i].imageLayout = imageInfos[3].imageLayout;
+			continue;
+		}
+
+		Com_Memset( &sceneSamplerDef, 0, sizeof( sceneSamplerDef ) );
+		sceneSamplerDef.address_mode = sceneImage->wrapClampMode;
+		if ( sceneImage->flags & IMGFLAG_MIPMAP ) {
+			sceneSamplerDef.gl_mag_filter = gl_filter_max;
+			sceneSamplerDef.gl_min_filter = gl_filter_min;
+		} else {
+			sceneSamplerDef.gl_mag_filter = GL_LINEAR;
+			sceneSamplerDef.gl_min_filter = GL_LINEAR;
+			sceneSamplerDef.noAnisotropy = qtrue;
+		}
+		imageInfos[4 + i].sampler = vk_find_sampler( &sceneSamplerDef );
+		imageInfos[4 + i].imageView = sceneImage->view;
+		imageInfos[4 + i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	}
 
 	Com_Memset( bufferInfos, 0, sizeof( bufferInfos ) );
 	bufferInfos[0].buffer = vk.rt.world_vertex_buffer.buffer;
@@ -4589,87 +5933,101 @@ static qboolean vk_rt_update_descriptor_set( void )
 	Com_Memset( writes, 0, sizeof( writes ) );
 	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	writes[0].pNext = &asInfo;
-	writes[0].dstSet = vk.rt.descriptor_set;
+	writes[0].dstSet = descriptorSet;
 	writes[0].dstBinding = RTX_RT_DESC_BINDING_TLAS;
 	writes[0].descriptorCount = 1;
 	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
 	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[1].dstSet = vk.rt.descriptor_set;
+	writes[1].dstSet = descriptorSet;
 	writes[1].dstBinding = RTX_RT_DESC_BINDING_OUTPUT;
 	writes[1].descriptorCount = 1;
 	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	writes[1].pImageInfo = &imageInfos[0];
 
 	writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[2].dstSet = vk.rt.descriptor_set;
+	writes[2].dstSet = descriptorSet;
 	writes[2].dstBinding = RTX_RT_DESC_BINDING_WORLD_VERTICES;
 	writes[2].descriptorCount = 1;
 	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[2].pBufferInfo = &bufferInfos[0];
 
 	writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[3].dstSet = vk.rt.descriptor_set;
+	writes[3].dstSet = descriptorSet;
 	writes[3].dstBinding = RTX_RT_DESC_BINDING_WORLD_INDICES;
 	writes[3].descriptorCount = 1;
 	writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[3].pBufferInfo = &bufferInfos[1];
 
 	writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[4].dstSet = vk.rt.descriptor_set;
+	writes[4].dstSet = descriptorSet;
 	writes[4].dstBinding = RTX_RT_DESC_BINDING_WORLD_MATERIALS;
 	writes[4].descriptorCount = 1;
 	writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[4].pBufferInfo = &bufferInfos[2];
 
 	writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[5].dstSet = vk.rt.descriptor_set;
+	writes[5].dstSet = descriptorSet;
 	writes[5].dstBinding = RTX_RT_DESC_BINDING_DYNAMIC_VERTICES;
 	writes[5].descriptorCount = 1;
 	writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[5].pBufferInfo = &bufferInfos[3];
 
 	writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[6].dstSet = vk.rt.descriptor_set;
+	writes[6].dstSet = descriptorSet;
 	writes[6].dstBinding = RTX_RT_DESC_BINDING_DYNAMIC_INDICES;
 	writes[6].descriptorCount = 1;
 	writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[6].pBufferInfo = &bufferInfos[4];
 
 	writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[7].dstSet = vk.rt.descriptor_set;
+	writes[7].dstSet = descriptorSet;
 	writes[7].dstBinding = RTX_RT_DESC_BINDING_DYNAMIC_MATERIALS;
 	writes[7].descriptorCount = 1;
 	writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[7].pBufferInfo = &bufferInfos[5];
 
 	writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[8].dstSet = vk.rt.descriptor_set;
+	writes[8].dstSet = descriptorSet;
 	writes[8].dstBinding = RTX_RT_DESC_BINDING_LIGHTS;
 	writes[8].descriptorCount = 1;
 	writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[8].pBufferInfo = &bufferInfos[6];
 
 	writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[9].dstSet = vk.rt.descriptor_set;
+	writes[9].dstSet = descriptorSet;
 	writes[9].dstBinding = RTX_RT_DESC_BINDING_HISTORY_IN;
 	writes[9].descriptorCount = 1;
 	writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	writes[9].pImageInfo = &imageInfos[1];
 
 	writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[10].dstSet = vk.rt.descriptor_set;
+	writes[10].dstSet = descriptorSet;
 	writes[10].dstBinding = RTX_RT_DESC_BINDING_HISTORY_OUT;
 	writes[10].descriptorCount = 1;
 	writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	writes[10].pImageInfo = &imageInfos[2];
 
 	writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	writes[11].dstSet = vk.rt.descriptor_set;
+	writes[11].dstSet = descriptorSet;
 	writes[11].dstBinding = RTX_RT_DESC_BINDING_TEMPORAL_PARAMS;
 	writes[11].descriptorCount = 1;
 	writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	writes[11].pBufferInfo = &bufferInfos[7];
+
+	writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[12].dstSet = descriptorSet;
+	writes[12].dstBinding = RTX_RT_DESC_BINDING_SCENE_COLOR;
+	writes[12].descriptorCount = 1;
+	writes[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[12].pImageInfo = &imageInfos[3];
+
+	writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[13].dstSet = descriptorSet;
+	writes[13].dstBinding = RTX_RT_DESC_BINDING_SCENE_TEXTURES;
+	writes[13].descriptorCount = RTX_RT_MAX_SCENE_TEXTURES;
+	writes[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[13].pImageInfo = &imageInfos[4];
 
 	qvkUpdateDescriptorSets( vk.device, ARRAY_LEN( writes ), writes, 0, NULL );
 	vk.rt.descriptorsValid = qtrue;
@@ -4679,14 +6037,34 @@ static qboolean vk_rt_update_descriptor_set( void )
 static qboolean vk_rt_ensure_dynamic_blas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSize frameBudgetBytes )
 {
 	VkDeviceSize ignoredBuildBytes = 0;
-
-	if ( !vk_rt_dynamic_blas_enabled() ) {
-		if ( vk.rt.dynamic_blas.valid ||
+	vec3_t estimatedCentroid;
+	uint32_t estimatedModelCount = 0;
+	uint32_t estimatedEffectCount = 0;
+	uint32_t estimatedSignature = 0u;
+	const int rebuildInterval = vk_rt_as_rebuild_interval();
+	const int prepStride = vk_rt_prep_frame_stride();
+	const float dirtyThreshold = MAX( 0.0f, vk_rt_as_dirty_threshold() );
+	const qboolean hadDynamicResources =
+		( vk.rt.dynamic_blas.valid ||
 			vk.rt.dynamic_vertex_buffer.buffer != VK_NULL_HANDLE ||
 			vk.rt.dynamic_index_buffer.buffer != VK_NULL_HANDLE ||
-			vk.rt.dynamic_material_buffer.buffer != VK_NULL_HANDLE ) {
+			vk.rt.dynamic_material_buffer.buffer != VK_NULL_HANDLE ) ? qtrue : qfalse;
+	qboolean forceRebuild = qfalse;
+	qboolean shouldRebuild = qfalse;
+
+	if ( !vk_rt_dynamic_blas_enabled() ) {
+		const qboolean dynamicStateChanged =
+			hadDynamicResources ||
+			vk.rt.dynamic_entity_count != 0u ||
+			vk.rt.dynamic_effect_count != 0u ||
+			vk.rt.dynamic_scene_signature != 0u;
+
+		if ( hadDynamicResources ) {
 			if ( vk_rt_debug_as_stats_level() >= 1 ) {
 				ri.Printf( PRINT_DEVELOPER, "RTX RT: dynamic BLAS disabled via rtx_rt_dynamic_blas 0, using world-only TLAS instances\n" );
+			}
+			if ( !vk_rt_wait_for_inflight_frames( "dynamic BLAS disable" ) ) {
+				return qfalse;
 			}
 		}
 
@@ -4700,13 +6078,73 @@ static qboolean vk_rt_ensure_dynamic_blas( VkDeviceSize *frameBudgetBytesUsed, V
 		vk.rt.dynamic_entity_count = 0;
 		vk.rt.dynamic_effect_count = 0;
 		vk.rt.stats.dynamic_triangles = 0;
+		vk.rt.dynamic_scene_signature = 0u;
+		vk.rt.dynamic_last_rebuild_frame = tr.frameCount;
 		VectorCopy( vk.rt.dynamic_centroid_prev, vk.rt.dynamic_centroid_current );
+		VectorCopy( vk.rt.dynamic_centroid_prev, vk.rt.dynamic_last_rebuild_centroid );
+		if ( dynamicStateChanged ) {
+			vk.rt.needsRebuild = qtrue;
+		}
+		return qtrue;
+	}
+
+	estimatedSignature = vk_rt_estimate_dynamic_scene_signature(
+		estimatedCentroid,
+		&estimatedModelCount,
+		&estimatedEffectCount,
+		MAX( 1.0f, dirtyThreshold * 0.25f ) );
+	vk.rt.dynamic_entity_count = estimatedModelCount;
+	vk.rt.dynamic_effect_count = estimatedEffectCount;
+	VectorCopy( estimatedCentroid, vk.rt.dynamic_centroid_current );
+
+	if ( !hadDynamicResources && estimatedModelCount == 0u && estimatedEffectCount == 0u && backEnd.refdef.numPolys == 0 ) {
+		vk.rt.dynamic_scene_signature = estimatedSignature;
+		vk.rt.dynamic_last_rebuild_frame = tr.frameCount;
+		vk.rt.stats.dynamic_triangles = 0;
+		return qtrue;
+	}
+
+	if ( !hadDynamicResources ) {
+		shouldRebuild = qtrue;
+	} else {
+		vec3_t delta;
+		float centroidDelta;
+		const int framesSinceRebuild = ( vk.rt.dynamic_last_rebuild_frame >= 0 ) ?
+			( tr.frameCount - vk.rt.dynamic_last_rebuild_frame ) : rebuildInterval;
+
+		VectorSubtract( estimatedCentroid, vk.rt.dynamic_last_rebuild_centroid, delta );
+		centroidDelta = VectorLength( delta );
+
+		forceRebuild = ( estimatedModelCount == 0u && estimatedEffectCount == 0u && backEnd.refdef.numPolys == 0 ) ? qtrue : qfalse;
+		if ( !forceRebuild && prepStride > 1 && ( tr.frameCount % prepStride ) != 0 ) {
+			vk.rt.stats.prep_stride_skips++;
+			return qtrue;
+		}
+		if ( !forceRebuild && framesSinceRebuild < rebuildInterval ) {
+			vk.rt.stats.dynamic_rebuild_skips++;
+			return qtrue;
+		}
+		if ( !forceRebuild &&
+			estimatedSignature == vk.rt.dynamic_scene_signature &&
+			centroidDelta < dirtyThreshold ) {
+			vk.rt.stats.dynamic_rebuild_skips++;
+			return qtrue;
+		}
+
+		shouldRebuild = qtrue;
+	}
+
+	if ( !shouldRebuild ) {
 		return qtrue;
 	}
 
 	if ( !vk_rt_build_dynamic_scene_blas( frameBudgetBytesUsed, frameBudgetBytes, &ignoredBuildBytes ) ) {
 		return qfalse;
 	}
+
+	vk.rt.dynamic_scene_signature = estimatedSignature;
+	vk.rt.dynamic_last_rebuild_frame = tr.frameCount;
+	VectorCopy( vk.rt.dynamic_centroid_current, vk.rt.dynamic_last_rebuild_centroid );
 
 	return qtrue;
 }
@@ -4745,27 +6183,24 @@ static qboolean vk_rt_ensure_world_blas( VkDeviceSize *frameBudgetBytesUsed, VkD
 		return qfalse;
 	}
 
-	vk_rt_destroy_buffer( &vk.rt.world_vertex_buffer );
-	vk_rt_destroy_buffer( &vk.rt.world_index_buffer );
-
-	if ( !vk_rt_create_buffer(
+	if ( !vk_rt_ensure_buffer_capacity(
+		&vk.rt.world_vertex_buffer,
 		geometry.numVertices * sizeof( rtxRtPackedVertex_t ),
 		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
 			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		qtrue,
-		"rt world vertices",
-		&vk.rt.world_vertex_buffer ) ||
-		!vk_rt_create_buffer(
+		"rt world vertices" ) ||
+		!vk_rt_ensure_buffer_capacity(
+			&vk.rt.world_index_buffer,
 			geometry.numIndices * sizeof( uint32_t ),
 			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 				VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
 				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			qtrue,
-			"rt world indices",
-			&vk.rt.world_index_buffer ) ) {
+			"rt world indices" ) ) {
 		vk_rt_cpu_geometry_free( &geometry );
 		return qfalse;
 	}
@@ -4810,6 +6245,7 @@ static qboolean vk_rt_ensure_world_blas( VkDeviceSize *frameBudgetBytesUsed, VkD
 
 	vk.rt.worldGeometryReady = qtrue;
 	vk.rt.stats.world_build_bytes += (uint64_t)( vk.rt.world_blas.size + vk.rt.scratch_buffer.size );
+	vk.rt.needsRebuild = qtrue;
 	vk_rt_cpu_geometry_free( &geometry );
 	return qtrue;
 }
@@ -4901,6 +6337,10 @@ static qboolean vk_rt_build_tlas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSi
 		ri.Free( instances );
 		return qfalse;
 	}
+	if ( vk.rt.tlas.valid && vk.rt.tlasValid && !vk.rt.needsRebuild && vk.rt.tlas_instance_count == instanceCount ) {
+		ri.Free( instances );
+		return qtrue;
+	}
 
 	buildBytes = vk_rt_query_tlas_build_bytes( instanceCount, buildFlags );
 	if ( !vk_rt_budget_allows( buildBytes, frameBudgetBytesUsed, frameBudgetBytes ) ) {
@@ -4909,15 +6349,14 @@ static qboolean vk_rt_build_tlas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSi
 	}
 
 	if ( vk.rt.tlas_instance_capacity < instanceCount || vk.rt.tlas_instance_buffer.buffer == VK_NULL_HANDLE ) {
-		vk_rt_destroy_buffer( &vk.rt.tlas_instance_buffer );
-		if ( !vk_rt_create_buffer(
+		if ( !vk_rt_ensure_buffer_capacity(
+			&vk.rt.tlas_instance_buffer,
 			requestedCapacity * sizeof( VkAccelerationStructureInstanceKHR ),
 			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
 				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			qtrue,
-			"rt tlas instances",
-			&vk.rt.tlas_instance_buffer ) ) {
+			"rt tlas instances" ) ) {
 			ri.Free( instances );
 			return qfalse;
 		}
@@ -4962,6 +6401,11 @@ static qboolean vk_rt_build_tlas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSi
 		&instanceCount,
 		&buildSizes );
 
+	if ( vk.rt.tlas.valid ) {
+		if ( !vk_rt_wait_for_inflight_frames( "TLAS rebuild" ) ) {
+			return qfalse;
+		}
+	}
 	vk_rt_destroy_as( &vk.rt.tlas );
 	if ( !vk_rt_create_as( VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, buildSizes.accelerationStructureSize, "rt tlas", &vk.rt.tlas ) ) {
 		return qfalse;
@@ -4999,6 +6443,7 @@ static qboolean vk_rt_build_tlas( VkDeviceSize *frameBudgetBytesUsed, VkDeviceSi
 	vk.rt.tlas.valid = qtrue;
 	vk.rt.tlasValid = qtrue;
 	vk.rt.descriptorsValid = qfalse;
+	vk.rt.needsRebuild = qfalse;
 	vk.rt.stats.tlas_build_bytes += (uint64_t)( vk.rt.tlas.size + vk.rt.scratch_buffer.size );
 
 	return qtrue;
@@ -5056,7 +6501,7 @@ static qboolean vk_rt_update_temporal_state( void )
 
 	VectorCopy( backEnd.viewParms.or.origin, currentOrigin );
 	VectorCopy( backEnd.viewParms.or.axis[0], currentForward );
-	VectorCopy( backEnd.viewParms.or.axis[1], currentRight );
+	VectorScale( backEnd.viewParms.or.axis[1], -1.0f, currentRight );
 	VectorCopy( backEnd.viewParms.or.axis[2], currentUp );
 
 	if ( !vk_rt_ensure_temporal_params_buffer() ) {
@@ -5352,6 +6797,7 @@ static void vk_rt_fill_push_constants( rtxRtPushConstants_t *push )
 	const float halfFovX = tanf( DEG2RAD( backEnd.viewParms.fovX * 0.5f ) );
 	const float halfFovY = tanf( DEG2RAD( backEnd.viewParms.fovY * 0.5f ) );
 	vec3_t sunDir;
+	vec3_t sunColor;
 
 	Com_Memset( push, 0, sizeof( *push ) );
 	push->cameraOriginTanHalfFovX[0] = backEnd.viewParms.or.origin[0];
@@ -5364,9 +6810,9 @@ static void vk_rt_fill_push_constants( rtxRtPushConstants_t *push )
 	push->cameraForwardTanHalfFovY[2] = backEnd.viewParms.or.axis[0][2];
 	push->cameraForwardTanHalfFovY[3] = halfFovY;
 
-	push->cameraRightWidth[0] = backEnd.viewParms.or.axis[1][0];
-	push->cameraRightWidth[1] = backEnd.viewParms.or.axis[1][1];
-	push->cameraRightWidth[2] = backEnd.viewParms.or.axis[1][2];
+	push->cameraRightWidth[0] = -backEnd.viewParms.or.axis[1][0];
+	push->cameraRightWidth[1] = -backEnd.viewParms.or.axis[1][1];
+	push->cameraRightWidth[2] = -backEnd.viewParms.or.axis[1][2];
 	push->cameraRightWidth[3] = (float)vk.rt.output_width;
 
 	push->cameraUpHeight[0] = backEnd.viewParms.or.axis[2][0];
@@ -5374,19 +6820,16 @@ static void vk_rt_fill_push_constants( rtxRtPushConstants_t *push )
 	push->cameraUpHeight[2] = backEnd.viewParms.or.axis[2][2];
 	push->cameraUpHeight[3] = (float)vk.rt.output_height;
 
-	VectorCopy( tr.sunDirection, sunDir );
-	if ( VectorNormalize( sunDir ) == 0.0f ) {
-		VectorSet( sunDir, 0.0f, 0.0f, 1.0f );
-	}
+	vk_rt_resolve_sun_params( sunDir, sunColor, NULL );
 
 	push->sunDirection[0] = sunDir[0];
 	push->sunDirection[1] = sunDir[1];
 	push->sunDirection[2] = sunDir[2];
 	push->sunDirection[3] = 0.0f;
 
-	push->sunColorIntensity[0] = tr.sunLight[0];
-	push->sunColorIntensity[1] = tr.sunLight[1];
-	push->sunColorIntensity[2] = tr.sunLight[2];
+	push->sunColorIntensity[0] = sunColor[0];
+	push->sunColorIntensity[1] = sunColor[1];
+	push->sunColorIntensity[2] = sunColor[2];
 	push->sunColorIntensity[3] = vk_rt_sun_intensity();
 
 	push->debugMode = vk.rt.activeVisualizer;
@@ -5430,6 +6873,8 @@ static qboolean vk_rt_init( void )
 		props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
 		props2.pNext = &vk.rt.rt_pipeline_props;
 		qvkGetPhysicalDeviceProperties2( vk.physical_device, &props2 );
+		vk.rt.gpu_timestamp_period_ns = ( props2.properties.limits.timestampPeriod > 0.0f ) ?
+			props2.properties.limits.timestampPeriod : 1.0f;
 	}
 
 	vk.rt.needsRebuild = qtrue;
@@ -5481,8 +6926,11 @@ void vk_rt_invalidate( const char *reason )
 	vk.rt.history_read_index = 0;
 	vk.rt.temporal_has_prev_camera = qfalse;
 	vk.rt.post_validation_logged = qfalse;
+	vk.rt.dynamic_scene_signature = 0u;
+	vk.rt.dynamic_last_rebuild_frame = -1;
 	VectorClear( vk.rt.dynamic_centroid_current );
 	VectorClear( vk.rt.dynamic_centroid_prev );
+	VectorClear( vk.rt.dynamic_last_rebuild_centroid );
 }
 
 static void vk_rt_shutdown( void )
@@ -5527,6 +6975,10 @@ static void vk_rt_shutdown( void )
 		qvkDestroyQueryPool( vk.device, vk.rt.compaction_query_pool, NULL );
 		vk.rt.compaction_query_pool = VK_NULL_HANDLE;
 	}
+	if ( vk.rt.timing_query_pool != VK_NULL_HANDLE ) {
+		qvkDestroyQueryPool( vk.device, vk.rt.timing_query_pool, NULL );
+		vk.rt.timing_query_pool = VK_NULL_HANDLE;
+	}
 
 	vk_rt_reset_state();
 }
@@ -5538,6 +6990,13 @@ void vk_rt_trace_frame( void )
 	VkImageMemoryBarrier outputBarrier;
 	rtxRtPushConstants_t push;
 	int budgetMb;
+	int64_t cpuFrameStartUs = 0;
+	int64_t cpuStageStartUs = 0;
+	int64_t cpuNowUs = 0;
+	qboolean needCpuTiming = qfalse;
+	qboolean timingEnabled = qfalse;
+	uint32_t timingBaseQuery = 0u;
+	qboolean copiedToColor = qfalse;
 
 	if ( !vk_rt_trace_available() ) {
 		return;
@@ -5566,14 +7025,24 @@ void vk_rt_trace_frame( void )
 
 	if ( vk_rt_ui_passthrough_enabled() && ( backEnd.refdef.rdflags & RDF_NOWORLDMODEL ) ) {
 		vk.rt.stats.skipped_dispatches++;
-		if ( vk.rt.history_valid || vk.rt.temporal_has_prev_camera ) {
-			vk_rt_reset_temporal_history( "ui passthrough" );
-			vk.rt.temporal_has_prev_camera = qfalse;
-		}
 		if ( vk_rt_debug_as_stats_level() >= 2 ) {
 			ri.Printf( PRINT_DEVELOPER, "RTX RT: skipping dispatch for RDF_NOWORLDMODEL UI/console composition view\n" );
 		}
 		return;
+	}
+
+	vk_rt_read_timing_query_results();
+	vk_rt_update_scalability_controller();
+
+	needCpuTiming = ( vk_rt_perf_timing_mode() > 0 || vk_rt_adaptive_budget_enabled() || vk_rt_dynamic_resolution_enabled() ) ? qtrue : qfalse;
+	if ( needCpuTiming ) {
+		cpuFrameStartUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_dynamic_ms = 0.0f;
+		vk.rt.perf.cpu_world_ms = 0.0f;
+		vk.rt.perf.cpu_tlas_ms = 0.0f;
+		vk.rt.perf.cpu_temporal_ms = 0.0f;
+		vk.rt.perf.cpu_dispatch_ms = 0.0f;
+		vk.rt.perf.cpu_copy_ms = 0.0f;
 	}
 
 	budgetMb = vk_rt_as_build_budget_mb();
@@ -5588,24 +7057,52 @@ void vk_rt_trace_frame( void )
 		return;
 	}
 
+	if ( needCpuTiming ) {
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
 	if ( !vk_rt_ensure_dynamic_blas( &frameBuildBytesUsed, budgetBytes ) ) {
 		vk.rt.stats.skipped_dispatches++;
 		return;
 	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_dynamic_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
+	}
 
+	if ( needCpuTiming ) {
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
 	if ( !vk_rt_ensure_world_blas( &frameBuildBytesUsed, budgetBytes ) ) {
 		vk.rt.stats.skipped_dispatches++;
 		return;
 	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_world_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
+	}
 
+	if ( needCpuTiming ) {
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
 	if ( !vk_rt_build_tlas( &frameBuildBytesUsed, budgetBytes ) ) {
 		vk.rt.stats.skipped_dispatches++;
 		return;
 	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_tlas_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
+	}
 
+	if ( needCpuTiming ) {
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
 	if ( !vk_rt_update_temporal_state() ) {
 		vk.rt.stats.skipped_dispatches++;
 		return;
+	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_temporal_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
 	}
 
 	if ( !vk_rt_update_descriptor_set() || !vk.rt.sbtValid ) {
@@ -5614,6 +7111,25 @@ void vk_rt_trace_frame( void )
 	}
 
 	vk_end_render_pass();
+
+	if ( vk_rt_ensure_timing_query_pool() &&
+		vk.rt.timing_query_pool != VK_NULL_HANDLE &&
+		qvkCmdResetQueryPool &&
+		qvkCmdWriteTimestamp ) {
+		const uint32_t querySlot = (uint32_t)( tr.frameCount & 1u );
+		timingBaseQuery = querySlot * vk.rt.timing_query_stride;
+		qvkCmdResetQueryPool( vk.cmd->command_buffer, vk.rt.timing_query_pool, timingBaseQuery, vk.rt.timing_query_stride );
+		qvkCmdWriteTimestamp(
+			vk.cmd->command_buffer,
+			VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+			vk.rt.timing_query_pool,
+			timingBaseQuery + 0u );
+		timingEnabled = qtrue;
+	}
+
+	if ( needCpuTiming ) {
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
 
 	Com_Memset( &outputBarrier, 0, sizeof( outputBarrier ) );
 	outputBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5645,7 +7161,7 @@ void vk_rt_trace_frame( void )
 		vk.rt.pipeline_layout,
 		0,
 		1,
-		&vk.rt.descriptor_set,
+		&vk.rt.descriptor_set[ vk.cmd_index % NUM_COMMAND_BUFFERS ],
 		0,
 		NULL );
 
@@ -5668,9 +7184,29 @@ void vk_rt_trace_frame( void )
 		vk.rt.output_height,
 		1 );
 
+	if ( timingEnabled ) {
+		qvkCmdWriteTimestamp(
+			vk.cmd->command_buffer,
+			VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+			vk.rt.timing_query_pool,
+			timingBaseQuery + 1u );
+	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_dispatch_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
+		cpuStageStartUs = vk_rt_now_microseconds();
+	}
+
 	if ( vk.fboActive ) {
 		VkImageMemoryBarrier copyBarriers[2];
 		VkImageCopy copyRegion;
+		const qboolean needsFormatConversion =
+			( vk.rt.output_format != vk.color_format ) ? qtrue : qfalse;
+		const qboolean needsReconstruction =
+			( vk.rt.output_width != (uint32_t)glConfig.vidWidth ||
+				vk.rt.output_height != (uint32_t)glConfig.vidHeight ) ? qtrue : qfalse;
+		const qboolean needsBlit = ( needsReconstruction || needsFormatConversion ) ? qtrue : qfalse;
+		const qboolean canReconstructionBlit = needsBlit ? vk_rt_supports_reconstruction_blit() : qfalse;
 
 		Com_Memset( copyBarriers, 0, sizeof( copyBarriers ) );
 		copyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5711,18 +7247,58 @@ void vk_rt_trace_frame( void )
 		copyRegion.srcSubresource.layerCount = 1;
 		copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		copyRegion.dstSubresource.layerCount = 1;
-		copyRegion.extent.width = vk.rt.output_width;
-		copyRegion.extent.height = vk.rt.output_height;
 		copyRegion.extent.depth = 1;
 
-		qvkCmdCopyImage(
-			vk.cmd->command_buffer,
-			vk.rt.output_image,
-			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			vk.color_image,
-			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			1,
-			&copyRegion );
+		if ( needsBlit && canReconstructionBlit ) {
+			VkImageBlit blitRegion;
+			Com_Memset( &blitRegion, 0, sizeof( blitRegion ) );
+			blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blitRegion.srcSubresource.layerCount = 1;
+			blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blitRegion.dstSubresource.layerCount = 1;
+			blitRegion.srcOffsets[1].x = (int32_t)vk.rt.output_width;
+			blitRegion.srcOffsets[1].y = (int32_t)vk.rt.output_height;
+			blitRegion.srcOffsets[1].z = 1;
+			blitRegion.dstOffsets[1].x = glConfig.vidWidth;
+			blitRegion.dstOffsets[1].y = glConfig.vidHeight;
+			blitRegion.dstOffsets[1].z = 1;
+
+			qvkCmdBlitImage(
+				vk.cmd->command_buffer,
+				vk.rt.output_image,
+				VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				vk.color_image,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1,
+				&blitRegion,
+				VK_FILTER_LINEAR );
+			copiedToColor = qtrue;
+		} else {
+			if ( needsBlit && !canReconstructionBlit && !s_vkRtDynResBlitWarned ) {
+				ri.Printf( PRINT_WARNING,
+					"RTX RT: output blit path unavailable for output/color formats (%s -> %s)%s%s\n",
+					vk_format_string( vk.rt.output_format ),
+					vk_format_string( vk.color_format ),
+					needsReconstruction ? ", reconstruction requested" : "",
+					needsFormatConversion ? ", format conversion required" : "" );
+				s_vkRtDynResBlitWarned = qtrue;
+			}
+
+			if ( !needsFormatConversion ) {
+				copyRegion.extent.width = needsReconstruction ? MIN( vk.rt.output_width, (uint32_t)glConfig.vidWidth ) : vk.rt.output_width;
+				copyRegion.extent.height = needsReconstruction ? MIN( vk.rt.output_height, (uint32_t)glConfig.vidHeight ) : vk.rt.output_height;
+
+				qvkCmdCopyImage(
+					vk.cmd->command_buffer,
+					vk.rt.output_image,
+					VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					vk.color_image,
+					VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					1,
+					&copyRegion );
+				copiedToColor = qtrue;
+			}
+		}
 
 		copyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 		copyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -5743,6 +7319,22 @@ void vk_rt_trace_frame( void )
 			0, NULL,
 			2, copyBarriers );
 	}
+	if ( timingEnabled ) {
+		qvkCmdWriteTimestamp(
+			vk.cmd->command_buffer,
+			copiedToColor ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+			vk.rt.timing_query_pool,
+			timingBaseQuery + 2u );
+		qvkCmdWriteTimestamp(
+			vk.cmd->command_buffer,
+			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			vk.rt.timing_query_pool,
+			timingBaseQuery + 3u );
+	}
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_copy_ms = vk_rt_elapsed_ms( cpuStageStartUs, cpuNowUs );
+	}
 
 	vk_begin_post_bloom_render_pass();
 
@@ -5752,6 +7344,11 @@ void vk_rt_trace_frame( void )
 	vk.rt.history_read_index ^= 1u;
 	vk.rt.history_valid = qtrue;
 	VectorCopy( vk.rt.dynamic_centroid_current, vk.rt.dynamic_centroid_prev );
+	if ( needCpuTiming ) {
+		cpuNowUs = vk_rt_now_microseconds();
+		vk.rt.perf.cpu_frame_ms = vk_rt_elapsed_ms( cpuFrameStartUs, cpuNowUs );
+	}
+	vk_rt_log_perf_summary();
 
 	if ( vk_rt_post_validate_enabled() && !vk.rt.post_validation_logged ) {
 		ri.Printf( PRINT_ALL,
@@ -7233,6 +8830,7 @@ static void vk_wait_staging_buffer( void )
 static void vk_submit_staging_buffer( qboolean final )
 {
 	const VkPipelineStageFlags wait_dst_stage_mask = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+	VkQueue submitQueue = ( vk.async_queue_available && vk_rt_async_overlap_enabled() ) ? vk.async_queue : vk.queue;
 	VkSemaphore waits;
 	VkSubmitInfo submit_info;
 	VkResult res;
@@ -7244,6 +8842,7 @@ static void vk_submit_staging_buffer( qboolean final )
 	//ri.Printf( PRINT_WARNING, S_COLOR_CYAN ">>> flush %i bytes (final=%i)<<<\n", (int)vk_world.staging_buffer_offset, final );
 
 	vk_world.staging_buffer_offset = 0;
+	vk.rt.stats.texture_stream_flushes++;
 
 	VK_CHECK( qvkEndCommandBuffer( vk.staging_command_buffer ) );
 
@@ -7274,19 +8873,25 @@ static void vk_submit_staging_buffer( qboolean final )
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &vk.image_uploaded2;
 		vk.image_uploaded = vk.image_uploaded2;
-		VK_CHECK( qvkQueueSubmit( vk.queue, 1, &submit_info, vk.aux_fence ) );
+		VK_CHECK( qvkQueueSubmit( submitQueue, 1, &submit_info, vk.aux_fence ) );
 		vk.aux_fence_wait = qtrue;
+		if ( submitQueue != vk.queue ) {
+			vk.rt.stats.async_overlap_submits++;
+		}
 	} else {
 		// if submission before another upload then do explicit wait
 		submit_info.signalSemaphoreCount = 0;
 		submit_info.pSignalSemaphores = NULL;
-		VK_CHECK( qvkQueueSubmit( vk.queue, 1, &submit_info, vk.aux_fence ) );
+		VK_CHECK( qvkQueueSubmit( submitQueue, 1, &submit_info, vk.aux_fence ) );
 		res = qvkWaitForFences( vk.device, 1, &vk.aux_fence, VK_TRUE, 5 * 1000000000ULL );
 		if ( res != VK_SUCCESS ) {
 			ri.Error( ERR_FATAL, "vkWaitForFences() failed with %s at %s", vk_result_string( res ), __func__ );
 		}
 		qvkResetFences( vk.device, 1, &vk.aux_fence );
 		VK_CHECK( qvkResetCommandBuffer( vk.staging_command_buffer, 0 ) );
+		if ( submitQueue != vk.queue ) {
+			vk.rt.stats.async_overlap_submits++;
+		}
 	}
 }
 #endif // USE_UPLOAD_QUEUE
@@ -7297,6 +8902,7 @@ static void ensure_staging_buffer_allocation( VkDeviceSize size )
 	VkBufferCreateInfo buffer_desc;
 	VkMemoryRequirements memory_requirements;
 	VkMemoryAllocateInfo alloc_info;
+	VkDeviceSize budgetCap = 0;
 	uint32_t memory_type;
 	void *data;
 
@@ -7318,6 +8924,11 @@ static void ensure_staging_buffer_allocation( VkDeviceSize size )
 	vk_clean_staging_buffer();
 
 	vk_world.staging_buffer_size = MAX( size, STAGING_BUFFER_SIZE );
+	budgetCap = (VkDeviceSize)vk_rt_texture_stream_budget_mb() * 1024u * 1024u;
+	if ( budgetCap > 0 ) {
+		// Keep staging growth bounded by configured streaming budget while still satisfying this allocation.
+		vk_world.staging_buffer_size = MIN( vk_world.staging_buffer_size, MAX( size, budgetCap ) );
+	}
 	vk_world.staging_buffer_size = PAD( vk_world.staging_buffer_size, 1024 * 1024 );
 
 	buffer_desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -7355,6 +8966,11 @@ static void ensure_staging_buffer_allocation( VkDeviceSize size )
 #ifdef USE_VK_VALIDATION
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT object_type, uint64_t object, size_t location,
 	int32_t message_code, const char* layer_prefix, const char* message, void* user_data) {
+	if ( message && message[0] ) {
+		ri.Printf( PRINT_WARNING, "Vulkan validation (%s): %s\n",
+			( layer_prefix && layer_prefix[0] ) ? layer_prefix : "unknown",
+			message );
+	}
 #ifdef _WIN32
 	MessageBoxA( 0, message, layer_prefix, MB_ICONWARNING );
 	OutputDebugString(message);
@@ -7738,6 +9354,7 @@ static const char *renderer_name( const VkPhysicalDeviceProperties *props ) {
 static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_index ) {
 
 	VkPhysicalDeviceBufferDeviceAddressFeatures devaddr_features;
+	VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing_features;
 	VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_struct_features;
 	VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features;
 	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
@@ -7769,12 +9386,14 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 
 		// select queue family with presentation and graphics support
 		vk.queue_family_index = ~0U;
+		vk.queue_family_queue_count = 0;
 		for (i = 0; i < queue_family_count; i++) {
 			VkBool32 presentation_supported;
 			VK_CHECK( qvkGetPhysicalDeviceSurfaceSupportKHR( physical_device, i, vk_surface, &presentation_supported ) );
 
 			if (presentation_supported && (queue_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
 				vk.queue_family_index = i;
+				vk.queue_family_queue_count = queue_families[i].queueCount;
 				break;
 			}
 		}
@@ -7794,7 +9413,7 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		uint32_t device_extension_count;
 		const char *ext, *end;
 		char *str;
-		const float priority = 1.0;
+		const float priorities[2] = { 1.0f, 1.0f };
 		VkExtensionProperties *extension_properties;
 		VkDeviceQueueCreateInfo queue_desc;
 		VkPhysicalDeviceFeatures device_features;
@@ -7921,6 +9540,10 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 				if ( !accelerationStructure ) {
 					Q_strcat( missingCaps, sizeof( missingCaps ), VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME );
 				}
+				if ( !descriptorIndexing ) {
+					if ( missingCaps[0] ) Q_strcat( missingCaps, sizeof( missingCaps ), ", " );
+					Q_strcat( missingCaps, sizeof( missingCaps ), VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME );
+				}
 				if ( !deferredHostOperations ) {
 					if ( missingCaps[0] ) Q_strcat( missingCaps, sizeof( missingCaps ), ", " );
 					Q_strcat( missingCaps, sizeof( missingCaps ), VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME );
@@ -7973,6 +9596,7 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		if ( vk.caps.activeRtMode >= RTX_RT_MODE_RAY_QUERY ) {
 			device_extension_list[ device_extension_count++ ] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
 			device_extension_list[ device_extension_count++ ] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+			device_extension_list[ device_extension_count++ ] = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
 			enableBufferDeviceAddress = qtrue;
 			device_extension_list[ device_extension_count++ ] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
 
@@ -8029,8 +9653,8 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		queue_desc.pNext = NULL;
 		queue_desc.flags = 0;
 		queue_desc.queueFamilyIndex = vk.queue_family_index;
-		queue_desc.queueCount = 1;
-		queue_desc.pQueuePriorities = &priority;
+		queue_desc.queueCount = ( vk_rt_async_overlap_enabled() && vk.queue_family_queue_count > 1 ) ? 2 : 1;
+		queue_desc.pQueuePriorities = priorities;
 
 		Com_Memset( &features, 0, sizeof( features ) );
 		features.fillModeNonSolid = VK_TRUE;
@@ -8080,6 +9704,13 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		}
 
 		if ( vk.caps.activeRtMode >= RTX_RT_MODE_RAY_QUERY ) {
+			Com_Memset( &descriptor_indexing_features, 0, sizeof( descriptor_indexing_features ) );
+			*pNextPtr = &descriptor_indexing_features;
+			descriptor_indexing_features.pNext = NULL;
+			descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+			descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+			pNextPtr = (const void **)&descriptor_indexing_features.pNext;
+
 			*pNextPtr = &accel_struct_features;
 			accel_struct_features.pNext = NULL;
 			accel_struct_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -8345,9 +9976,11 @@ static void init_vulkan_library( void )
 	INIT_DEVICE_FUNCTION(vkCmdNextSubpass)
 	INIT_DEVICE_FUNCTION(vkCmdPipelineBarrier)
 	INIT_DEVICE_FUNCTION(vkCmdPushConstants)
+	INIT_DEVICE_FUNCTION(vkCmdResetQueryPool)
 	INIT_DEVICE_FUNCTION(vkCmdSetDepthBias)
 	INIT_DEVICE_FUNCTION(vkCmdSetScissor)
 	INIT_DEVICE_FUNCTION(vkCmdSetViewport)
+	INIT_DEVICE_FUNCTION(vkCmdWriteTimestamp)
 	INIT_DEVICE_FUNCTION(vkCreateBuffer)
 	INIT_DEVICE_FUNCTION(vkCreateCommandPool)
 	INIT_DEVICE_FUNCTION(vkCreateDescriptorPool)
@@ -8513,9 +10146,11 @@ static void deinit_device_functions( void )
 	qvkCmdNextSubpass							= NULL;
 	qvkCmdPipelineBarrier						= NULL;
 	qvkCmdPushConstants							= NULL;
+	qvkCmdResetQueryPool						= NULL;
 	qvkCmdSetDepthBias							= NULL;
 	qvkCmdSetScissor							= NULL;
 	qvkCmdSetViewport							= NULL;
+	qvkCmdWriteTimestamp						= NULL;
 	qvkCreateBuffer								= NULL;
 	qvkCreateCommandPool						= NULL;
 	qvkCreateDescriptorPool						= NULL;
@@ -10110,7 +11745,8 @@ static void vk_create_attachments( void )
 
 		// post-processing/msaa-resolve
 		create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, VK_SAMPLE_COUNT_1_BIT, vk.color_format,
-			usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &vk.color_image, &vk.color_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
+			usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+			&vk.color_image, &vk.color_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
 
 		// screenmap-msaa
 		if ( vk.screenMapSamples > VK_SAMPLE_COUNT_1_BIT ) {
@@ -10585,6 +12221,16 @@ void vk_initialize( void )
 	init_vulkan_library();
 
 	qvkGetDeviceQueue( vk.device, vk.queue_family_index, 0, &vk.queue );
+	vk.async_queue = VK_NULL_HANDLE;
+	vk.async_queue_available = qfalse;
+	if ( vk_rt_async_overlap_enabled() && vk.queue_family_queue_count > 1 ) {
+		qvkGetDeviceQueue( vk.device, vk.queue_family_index, 1, &vk.async_queue );
+		if ( vk.async_queue != VK_NULL_HANDLE ) {
+			vk.async_queue_available = qtrue;
+			ri.Printf( PRINT_ALL, "RTX RT: async queue overlap enabled (family=%u queues=%u)\n",
+				vk.queue_family_index, vk.queue_family_queue_count );
+		}
+	}
 
 	qvkGetPhysicalDeviceProperties( vk.physical_device, &props );
 
@@ -11432,6 +13078,9 @@ void vk_upload_image_data( image_t *image, int x, int y, int width, int height, 
 	VkCommandBuffer command_buffer;
 	VkBufferImageCopy regions[16];
 	VkBufferImageCopy region;
+	const int streamBudgetMb = vk_rt_texture_stream_budget_mb();
+	const VkDeviceSize streamBudgetBytes = ( streamBudgetMb > 0 ) ? (VkDeviceSize)streamBudgetMb * 1024u * 1024u : 0u;
+	const int frameMarker = tr.frameCount;
 
 	byte *buf;
 	int bpp;
@@ -11480,6 +13129,15 @@ void vk_upload_image_data( image_t *image, int x, int y, int width, int height, 
 
 #ifdef USE_UPLOAD_QUEUE
 	vk_wait_staging_buffer();
+	if ( s_vkRtTextureBudgetFrame != frameMarker ) {
+		s_vkRtTextureBudgetFrame = frameMarker;
+		s_vkRtTextureBudgetUsed = 0;
+	}
+	if ( streamBudgetBytes > 0 &&
+		( s_vkRtTextureBudgetUsed + (VkDeviceSize)buffer_size ) > streamBudgetBytes &&
+		vk_world.staging_buffer_offset > 0 ) {
+		vk_submit_staging_buffer( qfalse );
+	}
 
 	ensure_staging_buffer_allocation( buffer_size );
 
@@ -11499,6 +13157,7 @@ void vk_upload_image_data( image_t *image, int x, int y, int width, int height, 
 	}
 	//ri.Printf( PRINT_WARNING, "batch @%6i + %i %s \n", (int)vk_world.staging_buffer_offset, (int)buffer_size, image->imgName );
 	vk_world.staging_buffer_offset += buffer_size;
+	s_vkRtTextureBudgetUsed += (VkDeviceSize)buffer_size;
 
 	command_buffer = vk.staging_command_buffer;
 #else
@@ -11530,6 +13189,8 @@ void vk_upload_image_data( image_t *image, int x, int y, int width, int height, 
 	if ( buf != pixels ) {
 		ri.Hunk_FreeTempMemory( buf );
 	}
+
+	vk.rt.stats.texture_stream_bytes += (uint64_t)buffer_size;
 }
 
 

@@ -1,5 +1,7 @@
 build/
 output/
+.q3home/
+.q3home/*
 .vs/
 .vscode/
 !.vscode/
@@ -9,3 +11,4 @@ output/
 *.user
 cmake-*
 .idea
+__pycache__/

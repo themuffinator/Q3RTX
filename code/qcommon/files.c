@@ -316,6 +316,7 @@ static	cvar_t		*fs_excludeReference;
 
 static	searchpath_t	*fs_searchpaths;
 static	char		fs_loadedLibraryPath[MAX_OSPATH];
+static	char		fs_loadedLibraryDiagnostics[MAXPRINTMSG * 2];
 static	int			fs_readCount;			// total bytes read
 static	int			fs_loadCount;			// total files read
 static	int			fs_loadStack;			// total files in memory
@@ -5796,13 +5797,37 @@ FS_LoadLibrary
 Tries to load libraries within known searchpaths
 =================
 */
+static void FS_ResetLibraryDiagnostics( void )
+{
+	fs_loadedLibraryPath[0] = '\0';
+	fs_loadedLibraryDiagnostics[0] = '\0';
+}
+
+static void FS_AppendLibraryDiagnostic( const char *path )
+{
+	const char *sysError = Sys_LibraryError();
+	char line[MAX_OSPATH + 512];
+
+	Com_sprintf(
+		line,
+		sizeof( line ),
+		"  %s -> %s\n",
+		path ? path : "(null)",
+		( sysError && sysError[0] ) ? sysError : "unknown loader error" );
+	Q_strcat( fs_loadedLibraryDiagnostics, sizeof( fs_loadedLibraryDiagnostics ), line );
+}
+
 void *FS_LoadLibrary( const char *name )
 {
 	const searchpath_t *sp = fs_searchpaths;
 	void *libHandle = NULL;
 	char *fn;
 
-	fs_loadedLibraryPath[0] = '\0';
+	FS_ResetLibraryDiagnostics();
+	if ( !name || !*name ) {
+		Q_strncpyz( fs_loadedLibraryDiagnostics, "  (no library name provided)\n", sizeof( fs_loadedLibraryDiagnostics ) );
+		return NULL;
+	}
 
 	// Always probe the executable directory first so modular renderer
 	// binaries are found when game data lives in a separate install path.
@@ -5812,6 +5837,7 @@ void *FS_LoadLibrary( const char *name )
 		Q_strncpyz( fs_loadedLibraryPath, fn, sizeof( fs_loadedLibraryPath ) );
 		return libHandle;
 	}
+	FS_AppendLibraryDiagnostic( fn );
 
 	while ( !libHandle && sp ) {
 		while ( sp && ( sp->policy != DIR_STATIC || !sp->dir ) ) {
@@ -5824,6 +5850,7 @@ void *FS_LoadLibrary( const char *name )
 				Q_strncpyz( fs_loadedLibraryPath, fn, sizeof( fs_loadedLibraryPath ) );
 				return libHandle;
 			}
+			FS_AppendLibraryDiagnostic( fn );
 			sp = sp->next;
 		}
 	}
@@ -5838,4 +5865,9 @@ void *FS_LoadLibrary( const char *name )
 const char *FS_LoadedLibraryPath( void )
 {
 	return fs_loadedLibraryPath;
+}
+
+const char *FS_LoadLibraryDiagnostics( void )
+{
+	return fs_loadedLibraryDiagnostics;
 }

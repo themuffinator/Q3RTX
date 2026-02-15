@@ -248,7 +248,7 @@
       "source": "rt_main.rgen",
       "stage": "rgen",
       "defines": [],
-      "byte_size": 23728,
+      "byte_size": 23868,
       "reflection": {
         "descriptor_bindings": [
           {
@@ -289,6 +289,14 @@
             "binding": 11,
             "storage_class": "StorageBuffer",
             "descriptor_class": "storage_buffer",
+            "descriptor_count": 1
+          },
+          {
+            "name": "u_sceneColor",
+            "set": 0,
+            "binding": 12,
+            "storage_class": "UniformConstant",
+            "descriptor_class": "combined_image_sampler",
             "descriptor_count": 1
           }
         ],
@@ -332,7 +340,7 @@
       "source": "rt_main.rchit",
       "stage": "rchit",
       "defines": [],
-      "byte_size": 36188,
+      "byte_size": 41812,
       "reflection": {
         "descriptor_bindings": [
           {
@@ -406,6 +414,14 @@
             "storage_class": "StorageBuffer",
             "descriptor_class": "storage_buffer",
             "descriptor_count": 1
+          },
+          {
+            "name": "u_sceneTextures",
+            "set": 0,
+            "binding": 13,
+            "storage_class": "UniformConstant",
+            "descriptor_class": "combined_image_sampler",
+            "descriptor_count": 2048
           }
         ],
         "push_constants": [

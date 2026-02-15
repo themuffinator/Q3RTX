@@ -3360,6 +3360,7 @@ static void CL_InitRef( void ) {
 	GetRefAPI_t		GetRefAPI;
 	char			dllName[ MAX_OSPATH ];
 	const char		*loadedPath;
+	const char		*loadDiagnostics;
 #endif
 
 	CL_InitGLimp_Cvars();
@@ -3380,14 +3381,28 @@ static void CL_InitRef( void ) {
 	rendererLib = FS_LoadLibrary( dllName );
 	if ( !rendererLib )
 	{
+		loadDiagnostics = FS_LoadLibraryDiagnostics();
 		Com_Printf( S_COLOR_YELLOW "CL_InitRef: failed to load renderer module %s\n", dllName );
+		if ( loadDiagnostics && loadDiagnostics[0] ) {
+			Com_Printf( S_COLOR_YELLOW "CL_InitRef: loader diagnostics:\n%s", loadDiagnostics );
+		}
 		Cvar_ForceReset( "cl_renderer" );
 		Com_sprintf( dllName, sizeof( dllName ), RENDERER_PREFIX "_%s_" REND_ARCH_STRING DLL_EXT, cl_renderer->string );
 		Com_Printf( "CL_InitRef: attempting renderer module %s\n", dllName );
 		rendererLib = FS_LoadLibrary( dllName );
 		if ( !rendererLib )
 		{
-			Com_Error( ERR_FATAL, "Failed to load renderer %s", dllName );
+			loadDiagnostics = FS_LoadLibraryDiagnostics();
+			Com_Error(
+				ERR_FATAL,
+				"Failed to load renderer module \"%s\".\n"
+				"Attempted paths:\n%s"
+				"Common fixes:\n"
+				"  1. Ensure the renderer module is next to the executable.\n"
+				"  2. Install/update Vulkan runtime and GPU drivers.\n"
+				"  3. Select another renderer with \\cl_renderer and restart.",
+				dllName,
+				( loadDiagnostics && loadDiagnostics[0] ) ? loadDiagnostics : "  (no loader diagnostics available)\n" );
 		}
 	}
 
